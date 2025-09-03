@@ -1,0 +1,10 @@
+pybit
+torch
+pandas
+numpy
+ccxt
+python-dotenv
+requests
+websocket-client
+scikit-learn
+tenacity
