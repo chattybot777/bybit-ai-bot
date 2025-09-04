@@ -237,10 +237,19 @@ if __name__ == "__main__":
 
 
 def execute_trade(action, qty, leverage):
-    # Guard qty vs filters
-    qty = round_to_step(qty, QTY_STEP)
-    if qty <= 0 or (MIN_QTY > 0 and qty < MIN_QTY):
-        logging.warning(f"qty {qty} < MIN_QTY {MIN_QTY}; skipping")
+    # Require qty to meet min and step; otherwise skip
+    try:
+        qmin = float(MIN_QTY) if MIN_QTY else 0.0
+        qstep = float(QTY_STEP) if QTY_STEP else 0.0
+    except Exception:
+        qmin, qstep = 0.001, 0.001
+
+    # Round DOWN to step
+    if qstep and qstep > 0:
+        qty = (int(qty / qstep)) * qstep
+
+    if qty <= 0 or (qmin > 0 and qty < qmin):
+        logging.warning(f"qty {qty} < MIN_QTY {qmin}; skipping order")
         return False
 
     side = "Buy" if action == "long" else "Sell"
@@ -251,8 +260,9 @@ def execute_trade(action, qty, leverage):
                  side=side,
                  order_type="Market",
                  qty=str(qty),
-                 position_idx=0,         # required in one-way (Grok)
+                 positionIdx=0,      # one-way mode requires this
                  reduce_only=False)
+
     ok = r.get("retCode", 99999) == 0
     if not ok:
         logging.error(f"place_order failed: {r}")
