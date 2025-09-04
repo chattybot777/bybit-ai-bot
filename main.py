@@ -9,6 +9,38 @@ from pybit.unified_trading import HTTP, WebSocket
 
 # ---------- config & logging ----------
 load_dotenv()
+import logging, math, os
+
+def api_call(label, fn, **kw):
+    try:
+        r = fn(**kw)
+        rc = r.get("retCode", 0); rm = r.get("retMsg","")
+        if rc != 0:
+            logging.error(f"{label}: retCode={rc} retMsg={rm} kw={kw}")
+        else:
+            logging.info(f"{label}: OK")
+        return r
+    except Exception as e:
+        logging.error(f"{label}: EXC {type(e).__name__}: {e} kw={kw}")
+        return {"retCode": 99999, "retMsg": str(e)}
+
+MIN_QTY = float(os.getenv("MIN_QTY_DEFAULT","0"))
+QTY_STEP = float(os.getenv("QTY_STEP_DEFAULT","0"))
+
+def get_symbol_filters(session, symbol):
+    r = api_call("get_instruments_info", session.get_instruments_info,
+                 category="linear", symbol=symbol)
+    try:
+        info = r["result"]["list"][0]["lotSizeFilter"]
+        return float(info.get("minOrderQty", 0.001)), float(info.get("qtyStep", 0.001))
+    except Exception as e:
+        logging.warning(f"lotSizeFilter parse failed: {e}; using 0.001 defaults")
+        return 0.001, 0.001
+
+def round_to_step(qty, step):
+    if step <= 0: return qty
+    return (qty // step) * step if step >= 1 else int(qty/step)*step
+
 API_KEY    = os.getenv("BYBIT_API_KEY","")
 API_SECRET = os.getenv("BYBIT_API_SECRET","")
 SYMBOL     = os.getenv("SYMBOL","BTCUSDT")
@@ -91,12 +123,12 @@ def pred_price(df):
 
 def set_leverage(leverage:int):
     session.set_leverage(category="linear", symbol=SYMBOL,
-                         buyLeverage=str(leverage), sellLeverage=str(leverage))
+                         buy_leverage=str(leverage), sell_leverage=str(leverage))
 
 def place(side:str, qty:float):
     return session.place_order(category="linear", symbol=SYMBOL,
                                side=("Buy" if side=='long' else "Sell"),
-                               order_type="Market", qty=qty, reduce_only=False)
+                               order_type="Market", qty=str(qty), reduce_only=False)
 
 def wallet_equity():
     res = session.get_wallet_balance(accountType="UNIFIED")
@@ -116,7 +148,7 @@ def close_all_positions():
             qty  = float(p.get("size", 0))
             if qty>0:
                 session.place_order(category="linear", symbol=SYMBOL,
-                                    side=side, order_type="Market", qty=qty, reduce_only=True)
+                                    side=side, order_type="Market", qty=str(qty), reduce_only=True)
         logging.info("Requested close of all positions.")
     except Exception as e:
         logging.error(f"close_all_positions error: {e}")
@@ -155,6 +187,7 @@ def round_to_step(qty, step):
     return math.floor(qty / step) * step
 
 def main():
+    bootstrap_bybit()
     if not API_KEY or not API_SECRET:
         logging.error("Missing BYBIT_API_KEY / BYBIT_API_SECRET. Set them in .env.")
         return
@@ -204,22 +237,23 @@ if __name__ == "__main__":
 
 
 def execute_trade(action, qty, leverage):
-    # Guard qty against min/step
+    # Guard qty vs filters
     qty = round_to_step(qty, QTY_STEP)
     if qty <= 0 or (MIN_QTY > 0 and qty < MIN_QTY):
         logging.warning(f"qty {qty} < MIN_QTY {MIN_QTY}; skipping")
         return False
 
-    # Set leverage using v5 param names as strings
-    api_call("set_leverage", session.set_leverage,
-             category="linear", symbol=SYMBOL,
-             buyLeverage=str(leverage), sellLeverage=str(leverage))
-
     side = "Buy" if action == "long" else "Sell"
 
     r = api_call("place_order", session.place_order,
-                 category="linear", symbol=SYMBOL, side=side,
-                 order_type="Market", qty=str(qty),
-                 positionIdx=0, reduce_only=False)
-
-    return r.get("retCode", 99999) == 0
+                 category="linear",
+                 symbol=SYMBOL,
+                 side=side,
+                 order_type="Market",
+                 qty=str(qty),
+                 position_idx=0,         # required in one-way (Grok)
+                 reduce_only=False)
+    ok = r.get("retCode", 99999) == 0
+    if not ok:
+        logging.error(f"place_order failed: {r}")
+    return ok
