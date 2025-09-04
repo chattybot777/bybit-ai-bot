@@ -23,7 +23,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logging.info(f"Booting bot | symbol={SYMBOL} | testnet={TESTNET} | paused={BOT_PAUSED}")
 
 # ---------- bybit clients ----------
-session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
+RECV_WINDOW = int(os.getenv('RECV_WINDOW','60000'))
+session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET, recv_window=RECV_WINDOW)
 ws      = WebSocket(testnet=TESTNET, channel_type="linear")
 
 # ---------- tiny LSTM + ensemble ----------
