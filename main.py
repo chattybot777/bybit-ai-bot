@@ -93,7 +93,7 @@ def pred_price(df):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
 def set_leverage(leverage:int):
     session.set_leverage(category="linear", symbol=SYMBOL,
-                         buy_leverage=leverage, sell_leverage=leverage)
+                         buyLeverage=str(leverage), sellLeverage=str(leverage))
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
 def place(side:str, qty:float):
