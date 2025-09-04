@@ -1,10 +1,9 @@
 pybit
-torch
 pandas
-numpy
-ccxt
+numpy==1.26.4
 python-dotenv
 requests
 websocket-client
-scikit-learn
 tenacity
+ccxt
+scikit-learn==1.5.1
