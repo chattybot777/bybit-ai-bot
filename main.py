@@ -1,269 +1,342 @@
-# main.py — Bybit AI Trading Bot (Grok plan, safe-boot guards)
-import os, time, logging, numpy as np, pandas as pd, torch, torch.nn as nn
-from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential
+import os, time, math, logging, pickle
+from datetime import datetime, timedelta, timezone
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.exceptions import NotFittedError
-from pybit.unified_trading import HTTP, WebSocket
+from pybit.unified_trading import HTTP
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-# ---------- config & logging ----------
-load_dotenv()
-import logging, math, os
+# ---------- Config / Env ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+TESTNET = os.getenv("TESTNET","true").lower()=="true"
+SYMBOL = os.getenv("SYMBOL","BTCUSDT")
+RECV_WINDOW = int(os.getenv("RECV_WINDOW","60000"))
+DRAWDOWN_STOP = float(os.getenv("DRAWDOWN_STOP","0.20"))   # 20%
+POSITION_SIZE_PCT = float(os.getenv("POSITION_SIZE_PCT","0.05"))  # 5%
+LEVERAGE_DEFAULT = os.getenv("LEVERAGE_DEFAULT","1")
+COOLDOWN_SEC = 15*60
+MAX_TRADES_PER_DAY = 10
+
+# ---------- Session ----------
+session = HTTP(testnet=TESTNET,
+               api_key=os.getenv("BYBIT_API_KEY"),
+               api_secret=os.getenv("BYBIT_API_SECRET"),
+               recv_window=RECV_WINDOW)
+
+# ---------- Helpers ----------
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = (delta.clip(lower=0)).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    # TR = max(H-L, |H-PrevC|, |L-PrevC|)
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def day_key(ts: datetime):
+    return ts.strftime("%Y-%m-%d")
 
 def api_call(label, fn, **kw):
     try:
         r = fn(**kw)
         rc = r.get("retCode", 0); rm = r.get("retMsg","")
-        if rc != 0:
-            logging.error(f"{label}: retCode={rc} retMsg={rm} kw={kw}")
-        else:
+        if rc == 0:
             logging.info(f"{label}: OK")
+        elif rc == 110043:
+            # leverage not modified => treat as no-op OK
+            logging.info(f"{label}: no-op (leverage not modified)")
+        else:
+            logging.error(f"{label}: retCode={rc} retMsg={rm}. Request → {fn.__name__} {kw}")
         return r
     except Exception as e:
-        logging.error(f"{label}: EXC {type(e).__name__}: {e} kw={kw}")
+        logging.error(f"{label}: EXC {type(e).__name__}: {e}")
         return {"retCode": 99999, "retMsg": str(e)}
 
-MIN_QTY = float(os.getenv("MIN_QTY_DEFAULT","0"))
-QTY_STEP = float(os.getenv("QTY_STEP_DEFAULT","0"))
-
-def get_symbol_filters(session, symbol):
+# ---------- Instruments (min qty / step) ----------
+def load_instr_filters():
     r = api_call("get_instruments_info", session.get_instruments_info,
-                 category="linear", symbol=symbol)
-    try:
-        info = r["result"]["list"][0]["lotSizeFilter"]
-        return float(info.get("minOrderQty", 0.001)), float(info.get("qtyStep", 0.001))
-    except Exception as e:
-        logging.warning(f"lotSizeFilter parse failed: {e}; using 0.001 defaults")
-        return 0.001, 0.001
+                 category="linear", symbol=SYMBOL)
+    lot = (((r or {}).get("result") or {}).get("list") or [{}])[0].get("lotSizeFilter", {})
+    min_qty = float(lot.get("minOrderQty", "0.001"))
+    qty_step = float(lot.get("qtyStep", "0.001"))
+    return min_qty, qty_step
 
-def round_to_step(qty, step):
-    if step <= 0: return qty
-    return (qty // step) * step if step >= 1 else int(qty/step)*step
+MIN_QTY, QTY_STEP = load_instr_filters()
 
-API_KEY    = os.getenv("BYBIT_API_KEY","")
-API_SECRET = os.getenv("BYBIT_API_SECRET","")
-SYMBOL     = os.getenv("SYMBOL","BTCUSDT")
-TESTNET    = os.getenv("TESTNET","true").lower() == "true"
-BOT_PAUSED = os.getenv("BOT_PAUSED","false").lower() == "true"
-
-LEVERAGE_MAX        = 50       # upper bound (risk agent chooses within)
-POSITION_SIZE_PCT   = 0.05     # 5% of equity per trade
-DRAWDOWN_STOP       = 0.20     # stop if equity down >20%
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logging.info(f"Booting bot | symbol={SYMBOL} | testnet={TESTNET} | paused={BOT_PAUSED}")
-
-# ---------- bybit clients ----------
-RECV_WINDOW = int(os.getenv('RECV_WINDOW','60000'))
-session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET, recv_window=RECV_WINDOW)
-ws      = WebSocket(testnet=TESTNET, channel_type="linear")
-
-# ---------- tiny LSTM + ensemble ----------
+# ---------- Models ----------
 class LSTMModel(nn.Module):
-    def __init__(self, input_size=5, hidden_size=50, num_layers=2):
+    def __init__(self, input_size=8, hidden_size=50, num_layers=2):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc   = nn.Linear(hidden_size, 1)
+        self.fc = nn.Linear(hidden_size, 1)
     def forward(self, x):
-        out,_ = self.lstm(x)
-        return self.fc(out[:, -1, :])
+        out, _ = self.lstm(x)
+        return self.fc(out[:,-1,:])
 
-model    = LSTMModel()
-scaler   = MinMaxScaler()
-gb_model = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1)
-_gb_is_fitted = False  # until you add a training script
+model = LSTMModel(input_size=8, hidden_size=50, num_layers=2)
+scaler = MinMaxScaler()
+gb_model = None
 
-# Q-table (simple RL leverage)
-q_table = {}
-def state_from_vol(vol):
-    return 'low' if vol<0.01 else ('med' if vol<0.03 else 'high')
-def choose_leverage(state, eps=0.1):
-    if np.random.rand()<eps: return np.random.randint(1, LEVERAGE_MAX+1)
-    if state not in q_table: q_table[state]=[0]*LEVERAGE_MAX
-    return int(np.argmax(q_table[state])+1)
-def update_q(reward, state, action):
-    if state not in q_table: q_table[state]=[0]*LEVERAGE_MAX
-    q_table[state][action-1] += 0.1*(reward - q_table[state][action-1])
+def try_load_models():
+    ok = True
+    try:
+        if os.path.exists("lstm.pth"):
+            state = torch.load("lstm.pth", map_location="cpu")
+            model.load_state_dict(state)
+            logging.info("Loaded lstm.pth")
+        else:
+            logging.warning("lstm.pth missing — trading will SKIP until models provided")
+            ok = False
+    except Exception as e:
+        logging.error(f"Load LSTM failed: {e}"); ok = False
+    try:
+        if os.path.exists("scaler.pkl"):
+            with open("scaler.pkl","rb") as f: 
+                s = pickle.load(f)
+                # ensure it’s a MinMaxScaler
+                if isinstance(s, MinMaxScaler):
+                    global scaler
+                    scaler = s
+                    logging.info("Loaded scaler.pkl")
+        else:
+            logging.warning("scaler.pkl missing — trading will SKIP until models provided")
+            ok = False
+    except Exception as e:
+        logging.error(f"Load scaler failed: {e}"); ok = False
+    try:
+        if os.path.exists("gb.pkl"):
+            with open("gb.pkl","rb") as f:
+                global gb_model
+                gb_model = pickle.load(f)
+            logging.info("Loaded gb.pkl")
+        else:
+            logging.warning("gb.pkl missing — ensemble will be disabled")
+    except Exception as e:
+        logging.error(f"Load GB failed: {e}")
+    return ok
 
-# ---------- helpers ----------
-def compute_rsi(close, period=14):
-    delta = close.diff()
-    gain  = (delta.where(delta>0, 0)).rolling(period).mean()
-    loss  = (-delta.where(delta<0,0)).rolling(period).mean()
-    rs = gain / loss
-    return 100 - (100/(1+rs))
+MODELS_READY = try_load_models()
 
-def fetch_klines():
-    # Bybit expects interval string like "60" for 1h
-    res = api_call("get_kline", session.get_kline, category="linear", symbol=SYMBOL, interval="60", limit=200)
-    kl  = res["result"]["list"]
-    df  = pd.DataFrame(kl, columns=['time','open','high','low','close','volume','turnover']).astype(float)
-    df['time'] = pd.to_datetime(df['time'], unit='ms')
-    df = df.sort_values('time').set_index('time')
-    df['ma50'] = df['close'].rolling(50).mean()
-    df['rsi']  = compute_rsi(df['close'])
-    df['volatility'] = df['close'].pct_change().rolling(20).std()
+# ---------- Data ----------
+def fetch_ohlc(limit=200):
+    r = api_call("get_kline", session.get_kline,
+                 category="linear", symbol=SYMBOL, interval="60", limit=limit)
+    rows = ((r.get("result") or {}).get("list") or [])
+    if not rows: return None
+    # v5 returns list of lists; order oldest->newest not guaranteed; normalize
+    df = pd.DataFrame(rows, columns=["start","open","high","low","close","volume","turnover"])
+    for c in ["open","high","low","close","volume","turnover"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["start"] = pd.to_datetime(pd.to_numeric(df["start"], errors="coerce"), unit="ms", utc=True)
+    df = df.dropna().sort_values("start").reset_index(drop=True)
+    # features
+    df["ma50"] = df["close"].rolling(50).mean()
+    df["rsi"] = compute_rsi(df["close"], 14)
+    df["volatility"] = df["close"].pct_change().rolling(20).std()
+    df["atr14"] = compute_atr(df[["high","low","close"]].rename(columns=str), 14)
     return df.dropna()
 
-def pred_price(df):
-    # LSTM (untrained) + GB (guarded). Train later per Grok plan.
-    feats   = df[['open','high','low','close','volume']].values
-    scaled  = scaler.fit_transform(feats).reshape(1,-1,5)
-    x_t     = torch.tensor(scaled, dtype=torch.float32)
+def latest_price(df): return float(df["close"].iloc[-1])
+
+# ---------- Prediction ----------
+def predict_next_close(df):
+    # features: OHLCV + ma50 + rsi + volatility  (8)
+    feats = df[["open","high","low","close","volume","ma50","rsi","volatility"]].values.astype("float32")
+    # scale and LSTM over last sequence window
+    seq = 32
+    if feats.shape[0] < seq: return None
+    scaled = scaler.transform(feats) if hasattr(scaler, "min_") else feats
+    X = torch.tensor(scaled[-seq:].reshape(1, seq, 8), dtype=torch.float32)
     with torch.no_grad():
-        lstm_pred = float(model(x_t).item())
-    gb_pred = 0.0
-    if _gb_is_fitted:
-        try:
-            gb_pred = float(gb_model.predict(feats[-1].reshape(1,-1))[0])
-        except NotFittedError:
-            gb_pred = 0.0
-    return (lstm_pred + gb_pred)/2.0
+        lstm_pred = model(X).item()
+    # Ensemble with GB on the last feature row (unscaled raw works if GB trained that way)
+    if gb_model is not None:
+        gb_pred = gb_model.predict(feats[-1:].astype("float32"))[0]
+        return (lstm_pred + float(gb_pred)) / 2.0
+    return lstm_pred
 
-def set_leverage(leverage:int):
-    session.set_leverage(category="linear", symbol=SYMBOL,
-                         buy_leverage=str(leverage), sell_leverage=str(leverage))
-
-def place(side:str, qty:float):
-    return session.place_order(category="linear", symbol=SYMBOL,
-                               side=("Buy" if side=='long' else "Sell"),
-                               order_type="Market", qty=str(qty), reduce_only=False)
-
-def wallet_equity():
-    res = session.get_wallet_balance(accountType="UNIFIED")
+# ---------- Position / Orders ----------
+def get_equity():
+    r = api_call("get_wallet_balance", session.get_wallet_balance, accountType="UNIFIED")
     try:
-        return float(res['result']['list'][0]['totalEquity'])
+        lst = (r["result"]["list"][0]["totalEquity"])
+        return float(lst)
     except Exception:
-        for acct in res.get('result',{}).get('list',[]):
-            if 'totalEquity' in acct:
-                return float(acct['totalEquity'])
         return 0.0
 
-def close_all_positions():
+def get_position():
+    r = api_call("get_positions", session.get_positions, category="linear", symbol=SYMBOL)
+    arr = (r.get("result") or {}).get("list") or []
+    if not arr: return None
+    p = arr[0]
+    size = float(p.get("size","0") or 0)
+    if size == 0: return None
+    side = p.get("side","").capitalize()   # "Buy" or "Sell"
+    avg_price = float(p.get("avgPrice","0") or 0)
+    created = p.get("createdTime") or p.get("updatedTime")
+    opened_at = None
     try:
-        pos = session.get_positions(category="linear", symbol=SYMBOL)["result"]["list"]
-        for p in pos:
-            side = "Sell" if p["side"]=="Buy" else "Buy"
-            qty  = float(p.get("size", 0))
-            if qty>0:
-                session.place_order(category="linear", symbol=SYMBOL,
-                                    side=side, order_type="Market", qty=str(qty), reduce_only=True)
-        logging.info("Requested close of all positions.")
-    except Exception as e:
-        logging.error(f"close_all_positions error: {e}")
+        if created: opened_at = datetime.fromtimestamp(int(created)/1000, tz=timezone.utc)
+    except Exception: 
+        opened_at = None
+    return {"size": size, "side": side, "avg_price": avg_price, "opened_at": opened_at}
 
-# ---------- main loop ----------
+def round_to_step(q):
+    if QTY_STEP <= 0: return q
+    return math.floor(q / QTY_STEP) * QTY_STEP
 
-def bootstrap_bybit():
-    try:
-        r = api_call("switch_position_mode", session.switch_position_mode,
-                     category="linear", symbol=SYMBOL, mode=0)  # 0 = One-Way
-        # Log the response explicitly too
-        logging.info(f"switch_position_mode raw: {r}")
-    except Exception as e:
-        logging.warning(f"switch_position_mode failed: {e}")
+def compute_leverage(risk_score):
+    # Grok: leverage = min(50, max(1, 50/(risk+1)))
+    lev = int(max(1, min(50, round(50 / (risk_score + 1)))))
+    return str(lev)
 
-import math
+def set_leverage(lev_str):
+    api_call("set_leverage", session.set_leverage,
+             category="linear", symbol=SYMBOL,
+             buy_leverage=lev_str, sell_leverage=lev_str)
 
-MIN_QTY = 0.0
-QTY_STEP = 0.0
+def place_market(side, qty, reduce_only=False):
+    if qty <= 0:
+        return {"retCode": 10001, "retMsg": "qty<=0"}
+    if qty < MIN_QTY:
+        logging.warning(f"qty {qty} < MIN_QTY {MIN_QTY}; skipping")
+        return {"retCode": 10001, "retMsg": "qty<min"}
+    q_str = f"{qty:.10f}".rstrip("0").rstrip(".")
+    return api_call("place_order", session.place_order,
+                    category="linear", symbol=SYMBOL,
+                    side=side, order_type="Market",
+                    qty=q_str, positionIdx=0, reduce_only=reduce_only)
 
-def get_symbol_filters(session, symbol):
-    r = api_call("get_instruments_info", session.get_instruments_info,
-                 category="linear", symbol=symbol)
-    try:
-        info = r["result"]["list"][0]["lotSizeFilter"]
-        min_qty = float(info.get("minOrderQty", 0.0))
-        qty_step = float(info.get("qtyStep", 0.0))
-        return min_qty, qty_step
-    except Exception as e:
-        logging.warning(f"lotSizeFilter parse failed: {e}; using 0.001 defaults")
-        return 0.001, 0.001
+# ---------- Loop state ----------
+initial_equity = get_equity()
+last_trade_time = datetime.fromtimestamp(0, tz=timezone.utc)
+trades_today = 0
+day_marker = day_key(now_utc())
 
-def round_to_step(qty, step):
-    if step <= 0:
-        return qty
-    return math.floor(qty / step) * step
-
+# ---------- Main loop ----------
 def main():
-    bootstrap_bybit()
-    if not API_KEY or not API_SECRET:
-        logging.error("Missing BYBIT_API_KEY / BYBIT_API_SECRET. Set them in .env.")
-        return
-    eq0 = wallet_equity()
-    eq  = eq0
-    logging.info("Bot loop started.")
+    global last_trade_time, trades_today, day_marker
+    logging.info(f"Booting bot | symbol={SYMBOL} | testnet={TESTNET} | models_ready={MODELS_READY}")
+
     while True:
         try:
-            if os.getenv("BOT_PAUSED","false").lower()=="true":
-                logging.info("BOT_PAUSED=true — skipping entries (management only).")
-                time.sleep(30); continue
+            # reset daily counter
+            now = now_utc()
+            if day_key(now) != day_marker:
+                day_marker = day_key(now); trades_today = 0
 
-            df   = fetch_klines()
-            pr   = pred_price(df)
-            cur  = float(df['close'].iloc[-1])
-            vol  = float(df['volatility'].iloc[-1])
-            st   = state_from_vol(vol)
-            lev  = choose_leverage(st)
+            df = fetch_ohlc(limit=200)
+            if df is None or df.empty:
+                time.sleep(60); continue
 
-            # entry logic (per Grok thresholds)
+            px = latest_price(df)
+            risk_score = float(df["volatility"].iloc[-1] * 100.0)
+            ma50 = float(df["ma50"].iloc[-1])
+            rsi = float(df["rsi"].iloc[-1])
+            atr14 = float(df["atr14"].iloc[-1])
+
+            pos = get_position()  # check exits if any
+            if pos:
+                # --- Exit rules (Grok) ---
+                if pos["side"] == "Buy":
+                    tp = pos["avg_price"] * 1.015
+                    sl = max(pos["avg_price"] * 0.99, pos["avg_price"] - 2.0*atr14)  # ATR-based preference
+                    hit_tp = px >= tp
+                    hit_sl = px <= sl
+                else:  # Sell (short)
+                    tp = pos["avg_price"] * 0.985
+                    sl = min(pos["avg_price"] * 1.01, pos["avg_price"] + 2.0*atr14)
+                    hit_tp = px <= tp
+                    hit_sl = px >= sl
+
+                time_stop = False
+                if pos.get("opened_at"):
+                    time_stop = (now - pos["opened_at"]) >= timedelta(hours=4)
+
+                # Optional adaptive exit: if prediction flips hard, exit early
+                pred_ok = MODELS_READY
+                will_exit_on_flip = False
+                if pred_ok:
+                    pred = predict_next_close(df)
+                    if pred is not None:
+                        if pos["side"] == "Buy" and (pred < px): will_exit_on_flip = True
+                        if pos["side"] == "Sell" and (pred > px): will_exit_on_flip = True
+
+                if hit_tp or hit_sl or time_stop or will_exit_on_flip:
+                    close_side = "Sell" if pos["side"] == "Buy" else "Buy"
+                    logging.info(f"Exit condition met | side={pos['side']} | TP={hit_tp} SL={hit_sl} TIME={time_stop} FLIP={will_exit_on_flip}")
+                    # Close full position (reduce_only)
+                    place_market(close_side, qty=pos["size"], reduce_only=True)
+                    last_trade_time = now
+                    trades_today += 1
+                    time.sleep(60)
+                    continue  # next loop
+
+            # --- Entry rules (Grok) ---
+            if not MODELS_READY:
+                logging.info("Models not loaded (lstm.pth/scaler.pkl missing). Skipping entries.")
+                time.sleep(60); continue
+
+            # Frequency constraints
+            if (now - last_trade_time).total_seconds() < COOLDOWN_SEC:
+                logging.info("Cooldown active; skipping.")
+                time.sleep(60); continue
+            if trades_today >= MAX_TRADES_PER_DAY:
+                logging.info("Max trades reached for today; skipping.")
+                time.sleep(60); continue
+
+            pred = predict_next_close(df)
+            if pred is None:
+                time.sleep(60); continue
+
+            long_gate  = (pred > px*1.005) and (risk_score < 5) and (rsi < 50) and (px > ma50)
+            short_gate = (pred < px*0.995) and (risk_score < 5) and (rsi > 50) and (px < ma50)
+
             action = None
-            if pr > cur*1.005 and vol < 0.05: action = 'long'
-            elif pr < cur*0.995:              action = 'short'
+            if long_gate:  action = "long"
+            elif short_gate: action = "short"
 
             if action:
+                # Sizing
+                equity = get_equity()
+                if equity <= 0:
+                    logging.error("No equity; cannot size.")
+                    time.sleep(60); continue
+                raw_qty = (equity * POSITION_SIZE_PCT) / px
+                qty = round_to_step(raw_qty)
+                if qty < MIN_QTY:
+                    logging.warning(f"qty {qty} < min {MIN_QTY}; skip entry.")
+                    time.sleep(60); continue
+
+                # Adaptive leverage per trade
+                lev = compute_leverage(risk_score)
                 set_leverage(lev)
-                qty = max((eq*POSITION_SIZE_PCT)/cur, 0.0001)  # exchange precision varies
-                place(action, qty)
-                logging.info(f"Executed {action} lev={lev} qty={qty:.6f} price={cur}")
-                update_q(1 if action=='long' else -1, st, lev)
 
-            eq = wallet_equity()
-            if eq0 > 0:
-                dd = (eq0 - eq)/eq0
-                if dd > DRAWDOWN_STOP:
-                    logging.warning(f"Drawdown {dd:.2%} > {DRAWDOWN_STOP:.0%}. Pausing & closing.")
-                    close_all_positions()
-                    break
-
-            time.sleep(60)
+                side = "Buy" if action=="long" else "Sell"
+                r = place_market(side, qty=qty, reduce_only=False)
+                if r.get("retCode")==0:
+                    last_trade_time = now
+                    trades_today += 1
+            else:
+                logging.info("No entry signal.")
         except Exception as e:
             logging.error(f"Loop error: {e}")
-            time.sleep(30)
+        time.sleep(60)
 
 if __name__ == "__main__":
+    # Single leverage set on boot (baseline), per Grok we also set per-trade adaptively
+    set_leverage(LEVERAGE_DEFAULT)
     main()
-
-
-def execute_trade(action, qty, leverage):
-    # Require qty to meet min and step; otherwise skip
-    try:
-        qmin = float(MIN_QTY) if MIN_QTY else 0.0
-        qstep = float(QTY_STEP) if QTY_STEP else 0.0
-    except Exception:
-        qmin, qstep = 0.001, 0.001
-
-    # Round DOWN to step
-    if qstep and qstep > 0:
-        qty = (int(qty / qstep)) * qstep
-
-    if qty <= 0 or (qmin > 0 and qty < qmin):
-        logging.warning(f"qty {qty} < MIN_QTY {qmin}; skipping order")
-        return False
-
-    side = "Buy" if action == "long" else "Sell"
-
-    r = api_call("place_order", session.place_order,
-                 category="linear",
-                 symbol=SYMBOL,
-                 side=side,
-                 order_type="Market",
-                 qty=str(qty),
-                 positionIdx=0,      # one-way mode requires this
-                 reduce_only=False)
-
-    ok = r.get("retCode", 99999) == 0
-    if not ok:
-        logging.error(f"place_order failed: {r}")
-    return ok
