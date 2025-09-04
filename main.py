@@ -62,10 +62,9 @@ def compute_rsi(close, period=14):
     rs = gain / loss
     return 100 - (100/(1+rs))
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
 def fetch_klines():
     # Bybit expects interval string like "60" for 1h
-    res = session.get_kline(category="linear", symbol=SYMBOL, interval="60", limit=200)
+    res = api_call("get_kline", session.get_kline, category="linear", symbol=SYMBOL, interval="60", limit=200)
     kl  = res["result"]["list"]
     df  = pd.DataFrame(kl, columns=['time','open','high','low','close','volume','turnover']).astype(float)
     df['time'] = pd.to_datetime(df['time'], unit='ms')
@@ -90,12 +89,10 @@ def pred_price(df):
             gb_pred = 0.0
     return (lstm_pred + gb_pred)/2.0
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
 def set_leverage(leverage:int):
     session.set_leverage(category="linear", symbol=SYMBOL,
                          buyLeverage=str(leverage), sellLeverage=str(leverage))
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
 def place(side:str, qty:float):
     return session.place_order(category="linear", symbol=SYMBOL,
                                side=("Buy" if side=='long' else "Sell"),
@@ -125,6 +122,38 @@ def close_all_positions():
         logging.error(f"close_all_positions error: {e}")
 
 # ---------- main loop ----------
+
+def bootstrap_bybit():
+    try:
+        r = api_call("switch_position_mode", session.switch_position_mode,
+                     category="linear", symbol=SYMBOL, mode=0)  # 0 = One-Way
+        # Log the response explicitly too
+        logging.info(f"switch_position_mode raw: {r}")
+    except Exception as e:
+        logging.warning(f"switch_position_mode failed: {e}")
+
+import math
+
+MIN_QTY = 0.0
+QTY_STEP = 0.0
+
+def get_symbol_filters(session, symbol):
+    r = api_call("get_instruments_info", session.get_instruments_info,
+                 category="linear", symbol=symbol)
+    try:
+        info = r["result"]["list"][0]["lotSizeFilter"]
+        min_qty = float(info.get("minOrderQty", 0.0))
+        qty_step = float(info.get("qtyStep", 0.0))
+        return min_qty, qty_step
+    except Exception as e:
+        logging.warning(f"lotSizeFilter parse failed: {e}; using 0.001 defaults")
+        return 0.001, 0.001
+
+def round_to_step(qty, step):
+    if step <= 0:
+        return qty
+    return math.floor(qty / step) * step
+
 def main():
     if not API_KEY or not API_SECRET:
         logging.error("Missing BYBIT_API_KEY / BYBIT_API_SECRET. Set them in .env.")
@@ -172,3 +201,25 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def execute_trade(action, qty, leverage):
+    # Guard qty against min/step
+    qty = round_to_step(qty, QTY_STEP)
+    if qty <= 0 or (MIN_QTY > 0 and qty < MIN_QTY):
+        logging.warning(f"qty {qty} < MIN_QTY {MIN_QTY}; skipping")
+        return False
+
+    # Set leverage using v5 param names as strings
+    api_call("set_leverage", session.set_leverage,
+             category="linear", symbol=SYMBOL,
+             buyLeverage=str(leverage), sellLeverage=str(leverage))
+
+    side = "Buy" if action == "long" else "Sell"
+
+    r = api_call("place_order", session.place_order,
+                 category="linear", symbol=SYMBOL, side=side,
+                 order_type="Market", qty=str(qty),
+                 positionIdx=0, reduce_only=False)
+
+    return r.get("retCode", 99999) == 0
