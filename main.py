@@ -94,7 +94,7 @@ def try_load_models():
     ok = True
     try:
         if os.path.exists("lstm.pth"):
-            state = torch.load("lstm.pth", map_location="cpu")
+            state = torch.load("lstm.pth", map_location="cpu", weights_only=True)
             model.load_state_dict(state)
             logging.info("Loaded lstm.pth")
         else:
