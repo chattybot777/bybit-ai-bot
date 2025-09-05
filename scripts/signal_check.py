@@ -1,13 +1,12 @@
 import os, json, pickle, numpy as np, pandas as pd, torch, torch.nn as nn
 from pybit.unified_trading import HTTP
 
-# ---- config ----
 SYM     = os.getenv("SYMBOL","BTCUSDT")
 TESTNET = os.getenv("TESTNET","true").lower() == "true"
 RECV    = int(os.getenv("RECV_WINDOW","60000"))
-DELTA_STD = 0.5   # % gate for standard entries
-DELTA_OVR = 1.0   # % gate for override (ignore RSI/MA if risk ok)
-RISK_LIM  = 5.0   # risk_score < 5 required
+DELTA_STD = 0.5
+DELTA_OVR = 1.0
+RISK_LIM  = 5.0
 
 def rsi(series, period=14):
     d = series.diff()
@@ -47,6 +46,8 @@ def fetch_df():
     df = pd.DataFrame(rows, columns=["ts","open","high","low","close","volume","turnover"])
     for col in ["open","high","low","close","volume","turnover"]:
         df[col] = df[col].astype(float)
+    # Silence the pandas warning on strings by forcing numeric before to_datetime
+    df["ts"] = pd.to_numeric(df["ts"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     df = df.sort_values("ts").set_index("ts")
     df["ma50"]       = df["close"].rolling(50).mean()
@@ -64,8 +65,9 @@ def predict_price(df, model, scaler, gb):
     gb_pred = float(gb.predict(feats[-1].reshape(1, -1))[0])
     current = float(df["close"].iloc[-1])
     blended = (lstm_pred + gb_pred) / 2.0
+    # clamp extreme predictions ±10%
     low, high = current * 0.9, current * 1.1
-    blended = max(min(blended, high), low)  # clamp ±10%
+    blended = max(min(blended, high), low)
     return current, blended
 
 def main():
