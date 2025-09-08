@@ -11,10 +11,8 @@ from sklearn.ensemble import GradientBoostingRegressor
 from pybit.unified_trading import HTTP, WebSocket
 
 # ---------- Logging ----------
-logging.basicConfig(
-    filename="trading_bot.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+import sys
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')s - %(levelname)s - %(message)s"
 )
 
 load_dotenv()
@@ -303,6 +301,55 @@ def main():
         time.sleep(60)
 
 if __name__ == "__main__":
+    threading.Thread(target=start_health_server, daemon=True).start()
+    boot_diag()
+
     ws.ping()
     threading.Thread(target=lambda: [ws.ping() or time.sleep(20) for _ in iter(int, 1)], daemon=True).start()
     main()
+
+
+# ---- tiny HTTP health server for Render ----
+from http.server import BaseHTTPRequestHandler, HTTPServer
+def start_health_server():
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+            else:
+                self.send_response(404); self.end_headers()
+        def log_message(self, *args, **kwargs): pass
+    try:
+        port = int(os.getenv("PORT", "10000"))
+        HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+    except Exception as e:
+        logging.warning(f"health server failed: {e}")
+
+
+def boot_diag():
+    try:
+        logging.info("=== BOOT DIAG START ===")
+        logging.info(f"TESTNET={os.getenv('TESTNET')} SYMBOL={os.getenv('SYMBOL')} BOT_PAUSED={os.getenv('BOT_PAUSED')}")
+        # data path
+        try:
+            df = fetch_data()
+            cur = float(df['close'].iloc[-1])
+            pred = float(predict_price(df))
+            lev, risk, state = assess_risk(df)
+            logging.info(f"data_ok rows={len(df)} last={cur:.2f} pred={pred:.2f} Δ%={(pred/cur-1)*100:.2f} lev={lev} risk={risk:.2f} state={state}")
+        except Exception as e:
+            logging.warning(f"data_error: {e}")
+        # wallet / kline
+        try:
+            wb = session.get_wallet_balance(accountType="UNIFIED")['result']['list'][0]
+            logging.info(f"wallet_ok equity={float(wb.get('totalEquity',0)):.6f}")
+        except Exception as e:
+            logging.warning(f"wallet_error: {e}")
+        try:
+            k = session.get_kline(category='linear', symbol=os.getenv('SYMBOL','BTCUSDT'), interval='60', limit=2)['result']['list']
+            logging.info(f"kline_ok last_close={float(k[-1][4])}")
+        except Exception as e:
+            logging.warning(f"kline_error: {e}")
+        logging.info("=== BOOT DIAG END ===")
+    except Exception as e:
+        logging.warning(f"boot_diag error: {e}")
