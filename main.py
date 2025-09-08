@@ -12,8 +12,8 @@ from pybit.unified_trading import HTTP, WebSocket
 
 # ---------- Logging ----------
 import sys
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 import sys
-logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')s - %(levelname)s - %(message)s')s - %(levelname)s - %(message)s"
 )
 
 load_dotenv()
