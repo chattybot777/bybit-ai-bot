@@ -42,7 +42,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET, recv_window=RECV_WINDOW)
 try:
-    ws = WebSocket(testnet=TESTNET, channel_type="linear")
+    try:
+    ws = WebSocket(testnet=TESTNET, channel_type='linear')
+except Exception as e:
+    ws = None
+    logging.warning(f"WebSocket init failed: {e}")
 except Exception as e:
     ws = None
     logging.warning(f"WebSocket init failed: {e}")
