@@ -336,7 +336,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 def start_health_server():
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path == "/health":
+            if self.path in ("/health", "/"):
                 self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
             else:
                 self.send_response(404); self.end_headers()
