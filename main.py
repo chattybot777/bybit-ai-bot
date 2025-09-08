@@ -43,7 +43,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET, recv_window=RECV_WINDOW)
 try:
     try:
+    ws=None
+try:
     ws = WebSocket(testnet=TESTNET, channel_type='linear')
+except Exception as e:
+    logging.warning(f'WebSocket init failed: {e}')
 except Exception as e:
     ws = None
     logging.warning(f"WebSocket init failed: {e}")
@@ -309,15 +313,12 @@ def main():
         time.sleep(60)
 
 if __name__ == "__main__":
-    # start health server if available
     try:
         threading.Thread(target=start_health_server, daemon=True).start()
-    except Exception:
-        pass
-    # one-time diagnostics if available
+    except Exception as e:
+        logging.warning(f"health thread err: {e}")
     try:
         boot_diag()
     except Exception:
         pass
-    # start the trading loop
     main()
