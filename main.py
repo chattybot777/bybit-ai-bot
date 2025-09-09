@@ -365,7 +365,7 @@ def main():
                 df = fetch_data(symbol)
                 current_price = float(df["close"].iloc[-1])
                 predicted = predict_price(df)
-                leverage, risk, state, tp_pct, sl_pct, gate_std = assess_risk(df, symbol, sum(trade_counts_today.values())[symbol])
+
                 rsi = float(df["rsi"].iloc[-1])
                 ma50 = float(df["ma50"].iloc[-1])
                 # Exits
@@ -389,7 +389,7 @@ def main():
                             open_positions.pop(symbol)
                             last_trade_times[symbol] = time.time()
                             trade_counts_today[symbol] += 1
-                            sum(trade_counts_today.values())[symbol] = sum(trade_counts_today.values()).get(symbol, 0) + 1
+
                             update_q(symbol, reward, state_at_entry, lev_used)
                         continue
                 # Entries
