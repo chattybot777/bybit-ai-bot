@@ -99,7 +99,7 @@ gb_model: Optional[GradientBoostingRegressor] = None
 
 def load_artifacts():
     global model, scaler, gb_model
-    state = torch.load("lstm.pth", map_location="cpu")
+    state = (__import__("torch").load("lstm.pth", map_location="cpu", weights_only=True)  if "weights_only" in __import__("inspect").signature(__import__("torch").load).parameters  else __import__("torch").load("lstm.pth", map_location="cpu"))
     model.load_state_dict(state)
     model.eval()
     with open("scaler.pkl", "rb") as f:
@@ -259,7 +259,7 @@ def execute_trade(symbol: str, action: str, qty: float, leverage: int, entry_pri
     except (KeyError, ValueError):
         avg_entry = entry_price
     logging.info(f"ENTRY {action} {symbol} qty={qty}, lev={leverage}: avg_price={avg_entry}")
-    send_telegram(f"ENTRY {action.upper()} {symbol} Δ={delta_pct:.2f}% risk={risk:.2f} qty={qty} lev={leverage} @ {avg_entry:.2f} | {get_portfolio_summary()}")
+    send_telegram(f"ENTRY {action.upper()} {symbol} Δ={delta_pct:.2f}% risk={risk_score:.2f} qty={qty} lev={leverage} @ {avg_entry:.2f} | {get_portfolio_summary()}")
     return side, order, avg_entry
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
@@ -395,9 +395,9 @@ def main():
                 # Entries
                 delta_pct = (predicted / current_price - 1.0) * 100.0
                 action = None
-                if abs(delta_pct) >= 1.0 and risk < 5:
+                if abs(delta_pct) >= 1.0 and risk_score < 5:
                     action = "long" if delta_pct > 0 else "short"
-                elif abs(delta_pct) >= gate_std and risk < 5:
+                elif abs(delta_pct) >= gate_std and risk_score < 5:
                     if delta_pct > 0 and (rsi > 50.0 and current_price > ma50):
                         action = "long"
                     elif delta_pct < 0 and (rsi < 50.0 and current_price < ma50):
@@ -423,7 +423,7 @@ def main():
                     qty = quantize(raw_qty, qty_step, min_qty)
                     if qty >= min_qty:
                         entry_time = pd.Timestamp.now(tz='UTC')
-                        res = execute_trade(symbol, action, qty, leverage, current_price, entry_time, delta_pct, risk)
+                        res = execute_trade(symbol, action, qty, leverage, current_price, entry_time, delta_pct, risk_score)
                         if res[0] is None:
                             continue
                         open_side, order, avg_entry = res
@@ -432,7 +432,7 @@ def main():
                     else:
                         logging.info(f"Skipped {symbol}: qty {qty} < min {min_qty}")
                 else:
-                    logging.info(f"No entry {symbol}: Δ={delta_pct:.2f}% risk={risk:.2f} rsi={rsi:.2f} px={current_price:.2f} ma50={ma50:.2f} gate={gate_std:.2f}")
+                    logging.info(f"No entry {symbol}: Δ={delta_pct:.2f}% risk={risk_score:.2f} rsi={rsi:.2f} px={current_price:.2f} ma50={ma50:.2f} gate={gate_std:.2f}")
                     no_signal_minutes += 1
                     if no_signal_minutes >= 48 * 60:
                         send_telegram(f"Alive: 48h low signals | Cumulative P&L: {cumulative_pnl:.2f} | {get_portfolio_summary()}")
