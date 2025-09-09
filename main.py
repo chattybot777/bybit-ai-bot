@@ -383,7 +383,7 @@ def main():
                     if reason:
                         ok, reward = close_position(symbol, open_side, qty, entry_price, entry_time, reason, current_price)
                         if ok:
-                            global cumulative_pnl
+# removed stray global
                             cumulative_pnl += reward * (qty * entry_price)
                             open_positions.pop(symbol)
                             last_trade_times[symbol] = time.time()
