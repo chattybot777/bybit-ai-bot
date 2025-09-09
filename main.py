@@ -189,7 +189,7 @@ def choose_leverage(symbol: str, state: str, risk_score: float, trade_count: int
     lev = min(lev, base_lev)
     return lev
 
-def assess_risk(df: pd.DataFrame, symbol: str, trade_count: int) -> Tuple[int, float, str, float, float, float]:
+def assess_risk(df: pd.DataFrame, symbol: str, trade_count: int = 0) -> Tuple[int, float, str, float, float, float]:
     vol = float(df["volatility"].iloc[-1])
     state = get_state(vol)
     risk_score = vol * 100.0
@@ -298,7 +298,7 @@ def close_position(symbol: str, open_side: str, qty: float, entry_price: float, 
 # -------- Main loop --------
 last_trade_times: Dict[str, float] = {sym: 0.0 for sym in SYMBOLS}
 trade_counts_today: Dict[str, int] = {sym: 0 for sym in SYMBOLS}
-total_trade_counts: Dict[str, int] = {sym: 0 for sym in SYMBOLS}
+
 last_day_bucket = 0
 last_week_bucket = 0
 initial_balance = 0.0
@@ -354,7 +354,8 @@ def main():
                 last_trade_times = {sym: 0.0 for sym in SYMBOLS}
                 for s in SYMBOLS:
                     trade_counts_today[s] = 0
-                total_trade_counts = {sym: total_trade_counts.get(sym, 0) for sym in SYMBOLS}
+                for s in SYMBOLS:
+                    trade_counts_today[s] = 0
                 last_day_bucket = day_bucket
                 send_telegram(f"Daily Reset | Symbols: {SYMBOLS} | Cumulative P&L: {cumulative_pnl:.2f} USDT | {get_portfolio_summary()}")
             # Sequential per-symbol processing
@@ -364,7 +365,7 @@ def main():
                 df = fetch_data(symbol)
                 current_price = float(df["close"].iloc[-1])
                 predicted = predict_price(df)
-                leverage, risk, state, tp_pct, sl_pct, gate_std = assess_risk(df, symbol, total_trade_counts[symbol])
+                leverage, risk, state, tp_pct, sl_pct, gate_std = assess_risk(df, symbol, sum(trade_counts_today.values())[symbol])
                 rsi = float(df["rsi"].iloc[-1])
                 ma50 = float(df["ma50"].iloc[-1])
                 # Exits
@@ -388,7 +389,7 @@ def main():
                             open_positions.pop(symbol)
                             last_trade_times[symbol] = time.time()
                             trade_counts_today[symbol] += 1
-                            total_trade_counts[symbol] = total_trade_counts.get(symbol, 0) + 1
+                            sum(trade_counts_today.values())[symbol] = sum(trade_counts_today.values()).get(symbol, 0) + 1
                             update_q(symbol, reward, state_at_entry, lev_used)
                         continue
                 # Entries
