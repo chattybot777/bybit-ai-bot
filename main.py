@@ -360,6 +360,13 @@ def main():
                 send_telegram(f"Daily Reset | Symbols: {SYMBOLS} | Cumulative P&L: {cumulative_pnl:.2f} USDT | {get_portfolio_summary()}")
             # Sequential per-symbol processing
             for symbol in SYMBOLS:
+                # safe defaults to avoid NameError before assess_risk
+                risk_score = 999.0
+                state = 'unknown'
+                tp_pct = BASE_TP_PCT
+                sl_pct = BASE_SL_PCT
+                gate_std = BASE_TP_PCT
+
                 if (time.time() - last_trade_times[symbol]) < COOLDOWN_SEC or trade_counts_today[symbol] >= MAX_TRADES_PER_DAY:
                     continue
                 df = fetch_data(symbol)
