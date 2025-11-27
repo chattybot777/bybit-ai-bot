@@ -13,6 +13,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 from tenacity import retry, stop_after_attempt, wait_exponential
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import string # REQUIRED for aggressive environment variable cleanup
+import base64 # REQUIRED for Base64 decoding of environment secrets
 
 
 class SafeJSONEncoder(json.JSONEncoder):
@@ -39,28 +40,46 @@ torch.set_num_threads(1)
 def sanitize_env_var(value: str) -> str:
     """
     Aggressively strips whitespace, null bytes, and non-printable characters 
-    to prevent header errors from environments like Render (the key fix).
+    to prevent header errors from environments like Render.
     """
     if not value:
         return ""
     # 1. Strip all leading/trailing whitespace, including \n, \r, \t, etc.
     cleaned = value.strip()
-    # 2. Remove all internal/trailing carriage returns and newlines that .strip() might miss
+    # 2. Remove all internal/trailing carriage returns and newlines
     cleaned = cleaned.replace('\n', '').replace('\r', '').replace('\x00', '')
-    # 3. Filter out any non-printable ASCII characters (just for maximum safety)
+    # 3. Filter out any non-printable ASCII characters (safety)
     cleaned = ''.join(c for c in cleaned if c in string.printable)
-    return cleaned.strip() # Final aggressive strip for good measure
+    return cleaned.strip()
 
-# API Keys and Setup (REVISED, SANITIZED AUTHENTICATION BLOCK)
-API_KEY = sanitize_env_var(os.getenv("BYBIT_API_KEY", ""))
-API_SECRET = sanitize_env_var(os.getenv("BYBIT_API_SECRET") or os.getenv("API_SECRET") or "")
+def base64_decode(encoded_value: str) -> str:
+    """
+    Decodes a Base64 string after ensuring it is sanitized. 
+    This is the primary defense against Render's newline injection.
+    """
+    sanitized = sanitize_env_var(encoded_value)
+    if not sanitized:
+        return ""
+    try:
+        # Decode from base64 to bytes, then to string
+        return base64.b64decode(sanitized).decode('utf-8')
+    except Exception as e:
+        # Critical error logging to help diagnose bad Base64 input
+        logging.critical(f"Base64 decoding failed: {e}. Check if key is properly encoded.")
+        return ""
+
+
+# API Keys and Setup (REVISED AUTHENTICATION BLOCK - Now using Base64 Decode)
+# Retrieve the Base64 string from the environment and decode it immediately.
+API_KEY = base64_decode(os.getenv("BYBIT_API_KEY", ""))
+API_SECRET = base64_decode(os.getenv("BYBIT_API_SECRET") or os.getenv("API_SECRET") or "")
 
 # --- Diagnostic Logging (Safety Check) ---
 # Log the length of the sanitized key/secret to confirm cleanup
 logging.info(f"Auth Check: API_KEY length={len(API_KEY)} (Sanitized)")
 logging.info(f"Auth Check: API_SECRET length={len(API_SECRET)} (Sanitized)")
 if not API_KEY or not API_SECRET:
-    logging.critical("API credentials are empty after sanitization. Check Render environment variables!")
+    logging.critical("API credentials are empty after sanitization. Check Render environment variables and Base64 encoding!")
 
 TESTNET = (os.getenv("BYBIT_TESTNET") or os.getenv("TESTNET") or "true").lower() in ("1","true","yes")
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "60000"))
@@ -487,6 +506,9 @@ def execute_trade(symbol: str, action: str, qty: float, leverage: int,
         
     logging.info(f"ENTRY {action} {symbol} qty={qty}, lev={leverage}: avg_price={avg_entry}")
     send_telegram(f"ENTRY {action.upper()} {symbol} Δ={delta_pct:.2f}% risk={risk:.2f} qty={qty} lev={leverage} @ {avg_entry:.2f} | {get_portfolio_summary()}")
+    last_trade_times[symbol] = time.time()
+    trade_counts_today[symbol] = trade_counts_today.get(symbol, 0) + 1
+    total_trade_counts[symbol] = total_trade_counts.get(symbol, 0) + 1
     return side, order, avg_entry
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
@@ -681,7 +703,6 @@ def main():
                             cumulative_pnl += reward * (qty * entry_price) # Add raw P&L
                             update_q(symbol, reward, state_at_entry, lev_used) # RL update
                             open_positions.pop(symbol)
-                            last_trade_times[symbol] = time.time()
                         continue
 
                 # Entries (Signal Generation)
@@ -754,9 +775,6 @@ def main():
                         
                         open_side, order, avg_entry = res
                         open_positions[symbol] = (open_side, qty, avg_entry, entry_time, leverage, state)
-                        last_trade_times[symbol] = time.time()
-                        trade_counts_today[symbol] = trade_counts_today.get(symbol, 0) + 1
-                        total_trade_counts[symbol] = total_trade_counts.get(symbol, 0) + 1
                     else:
                         logging.info(
                             f"Skipped {symbol}: Notional {notional_check:.2f} < min {MIN_NOTIONAL_USDT} "
