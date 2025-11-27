@@ -12,11 +12,12 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.ensemble import GradientBoostingRegressor
 from tenacity import retry, stop_after_attempt, wait_exponential
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import string # REQUIRED for aggressive environment variable cleanup
 
 
 class SafeJSONEncoder(json.JSONEncoder):
     """
-    FIXED: Custom JSON encoder to reliably handle NumPy types (int64, float64) 
+    Custom JSON encoder to reliably handle NumPy types (int64, float64) 
     by converting them to standard Python int/float for serialization.
     """
     def default(self, o):
@@ -35,9 +36,32 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
 load_dotenv()
 torch.set_num_threads(1)
 
-# API Keys and Setup
-API_KEY = os.getenv("BYBIT_API_KEY", "")
-API_SECRET = os.getenv("BYBIT_API_SECRET") or os.getenv("API_SECRET") or ""
+def sanitize_env_var(value: str) -> str:
+    """
+    Aggressively strips whitespace, null bytes, and non-printable characters 
+    to prevent header errors from environments like Render (the key fix).
+    """
+    if not value:
+        return ""
+    # 1. Strip all leading/trailing whitespace, including \n, \r, \t, etc.
+    cleaned = value.strip()
+    # 2. Remove all internal/trailing carriage returns and newlines that .strip() might miss
+    cleaned = cleaned.replace('\n', '').replace('\r', '').replace('\x00', '')
+    # 3. Filter out any non-printable ASCII characters (just for maximum safety)
+    cleaned = ''.join(c for c in cleaned if c in string.printable)
+    return cleaned.strip() # Final aggressive strip for good measure
+
+# API Keys and Setup (REVISED, SANITIZED AUTHENTICATION BLOCK)
+API_KEY = sanitize_env_var(os.getenv("BYBIT_API_KEY", ""))
+API_SECRET = sanitize_env_var(os.getenv("BYBIT_API_SECRET") or os.getenv("API_SECRET") or "")
+
+# --- Diagnostic Logging (Safety Check) ---
+# Log the length of the sanitized key/secret to confirm cleanup
+logging.info(f"Auth Check: API_KEY length={len(API_KEY)} (Sanitized)")
+logging.info(f"Auth Check: API_SECRET length={len(API_SECRET)} (Sanitized)")
+if not API_KEY or not API_SECRET:
+    logging.critical("API credentials are empty after sanitization. Check Render environment variables!")
+
 TESTNET = (os.getenv("BYBIT_TESTNET") or os.getenv("TESTNET") or "true").lower() in ("1","true","yes")
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "60000"))
 
