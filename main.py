@@ -13,7 +13,6 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.ensemble import GradientBoostingRegressor
 from tenacity import retry, stop_after_attempt, wait_exponential
 from http.server import BaseHTTPRequestHandler, HTTPServer
-# --- NEW: Import Pybit exceptions for targeted error handling ---
 from pybit.unified_trading.exceptions import InvalidRequestError 
 
 
@@ -37,7 +36,6 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
 load_dotenv()
 torch.set_num_threads(1)
 
-# --- REVISED CLEANUP FUNCTION ---
 def sanitize_env_var(value: str) -> str:
     """
     Aggressively strips whitespace, null bytes, and non-printable characters 
@@ -52,18 +50,13 @@ def sanitize_env_var(value: str) -> str:
     cleaned = cleaned.replace('\n', '').replace('\r', '').replace('\t', '').replace('\x00', '')
     
     return cleaned.strip()
-# ------------------------------
-
 
 # API Keys and Setup 
 API_KEY = sanitize_env_var(os.getenv("BYBIT_API_KEY", "")) 
 API_SECRET = sanitize_env_var(os.getenv("BYBIT_API_SECRET") or os.getenv("API_SECRET") or "")
 
-# --- Diagnostic Logging (Safety Check) ---
-# We know the key is good now, but keep this for internal diagnosis
 logging.info(f"Auth Check: API_KEY length={len(API_KEY)} (Sanitized)")
 logging.info(f"Auth Check: API_SECRET length={len(API_SECRET)} (Sanitized)")
-# ----------------------------------------
 
 TESTNET = (os.getenv("BYBIT_TESTNET") or os.getenv("TESTNET") or "true").lower() in ("1","true","yes")
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "5000")) 
@@ -74,29 +67,28 @@ LEVERAGE_MAX = int(os.getenv("LEVERAGE_MAX", "20"))
 LEVERAGE_MIN = int(os.getenv("LEVERAGE_MIN", "10"))
 MIN_NOTIONAL_USDT = float(os.getenv("MIN_NOTIONAL_USDT", "10"))
 ENTRY_ALIGN_MODE = os.getenv("ENTRY_ALIGN_MODE","AND").upper()
-BASE_POSITION_PCT = float(os.getenv("BASE_POSITION_PCT", "0.05")) # Used as a soft cap on notional exposure relative to max leverage
+BASE_POSITION_PCT = float(os.getenv("BASE_POSITION_PCT", "0.05")) 
 DRAWDOWN_STOP = float(os.getenv("DRAWDOWN_STOP", "0.20"))
 RESET_PNL_WEEKLY = os.getenv("RESET_PNL_WEEKLY", "false").lower() == "true"
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.005")) # CRITICAL: Max equity loss (0.5%) per trade
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.005"))
 
 # Strategy knobs
-COOLDOWN_SEC = 15 * 60          # per-symbol cooldown
-MAX_TRADES_PER_DAY = 10         # per symbol
+COOLDOWN_SEC = 15 * 60          
+MAX_TRADES_PER_DAY = 10         
 TIME_STOP_HOURS = 4
 BASE_TP_PCT = 0.015
 BASE_SL_PCT = 0.010
-MIN_GATE_STD = float(os.getenv("MIN_GATE_STD", "0.003"))   # lower gate => more trades
-MIN_RISK = float(os.getenv("MIN_RISK", "4.0"))             # risk gate
+MIN_GATE_STD = float(os.getenv("MIN_GATE_STD", "0.003"))   
+MIN_RISK = float(os.getenv("MIN_RISK", "4.0"))             
 
 # Data hardening defaults
-VOL_FALLBACK = float(os.getenv("VOL_FALLBACK", "0.01"))     # ~1% 15m vol as a sane default
-VOL_CAP      = float(os.getenv("VOL_CAP", "0.20"))          # cap 15m vol at 20%
+VOL_FALLBACK = float(os.getenv("VOL_FALLBACK", "0.01"))     
+VOL_CAP      = float(os.getenv("VOL_CAP", "0.20"))          
 
 # Communications
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# --- GLOBAL API TIMEOUT (Increased to 15s for greater network stability) ---
 API_TIMEOUT = 15
 
 # Initialize Bybit Session
@@ -106,7 +98,6 @@ session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET, recv_win
 def get_top_symbols() -> List[str]:
     """Fetches top 3 USDT symbols by 24h turnover from Bybit."""
     try:
-        # Using the global API_TIMEOUT
         r = session.get_tickers(category="linear", **{"timeout": API_TIMEOUT})["result"]["list"]
         usdt = [t for t in r if t.get("symbol","").endswith("USDT")]
         cleaned = []
@@ -122,7 +113,6 @@ def get_top_symbols() -> List[str]:
         return [t["symbol"] for t in cleaned[:3]] or [t["symbol"] for t in usdt[:3]]
     except Exception as e:
         logging.warning(f"Symbol fetch error: {e}")
-        # --- Fallback to a minimal list ---
         return ["BTCUSDT","ETHUSDT","SOLUSDT"]
 
 _ENV_SYMBOLS_RAW = os.getenv("SYMBOLS", "").strip()
@@ -146,13 +136,11 @@ scaler: Optional[MinMaxScaler] = None
 gb_model: Optional[GradientBoostingRegressor] = None
 
 def load_artifacts():
-    """Loads pre-trained models and scaler from disk."""
+    """Loads pre-trained models and scaler from disk. REMOVED torch version check for stability."""
     global model, scaler, gb_model
-    # Safe torch.load with weights_only if supported
-    if "weights_only" in inspect.signature(torch.load).parameters:
-        state = torch.load("lstm.pth", map_location="cpu", weights_only=True)
-    else:
-        state = torch.load("lstm.pth", map_location="cpu")
+    # --- CRITICAL FIX: Removed version check that was causing AttributeError ---
+    state = torch.load("lstm.pth", map_location="cpu")
+    
     model.load_state_dict(state)
     model.eval()
     with open("scaler.pkl", "rb") as f:
@@ -160,7 +148,7 @@ def load_artifacts():
     with open("gb.pkl", "rb") as f:
         gb_model = pickle.load(f)
     logging.info("Artifacts loaded: Shared models for multi-symbol")
-
+    
 # -------- Q-table (RL leverage) persistence --------
 q_tables: Dict[str, Dict[str, List[float]]] = {}
 def load_q_tables():
@@ -194,7 +182,6 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def fetch_data(symbol: str) -> pd.DataFrame:
     """Fetches kline data and computes required indicators (RSI, MA50, Volatility)."""
-    # Using the global API_TIMEOUT
     r = session.get_kline(category="linear", symbol=symbol, interval="15", limit=200, **{"timeout": API_TIMEOUT}) 
     rows = r["result"]["list"]
     cols = ["start", "open", "high", "low", "close", "volume", "turnover"]
@@ -304,7 +291,6 @@ def choose_leverage(symbol: str, state: str, risk_score: float, trade_count: int
     lev_q_choice = np.random.randint(1, LEVERAGE_MAX + 1) if (np.random.rand() < epsilon) else (np.argmax(q) + 1)
     
     # 2. Risk-based cap (lower leverage for higher perceived risk)
-    # The '50' is an arbitrary scaling factor. Max risk score 9.99 -> min lev ~4x
     base_lev_cap = int(max(1, min(LEVERAGE_MAX, 50.0 / (risk_score + 1.0))))
     
     # Final leverage selection (min of Q-choice and Risk-cap, clamped by min/max)
@@ -347,7 +333,7 @@ def send_telegram(msg: str):
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         try:
             requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                         params={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=API_TIMEOUT) # Use global timeout
+                         params={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=API_TIMEOUT) 
         except Exception as e:
             logging.warning(f"Telegram error: {e}")
 
@@ -360,7 +346,6 @@ def quantize(value: float, step: float, minimum: float) -> float:
 def get_portfolio_summary() -> str:
     """Fetches a quick summary of current equity."""
     try:
-        # Using the global API_TIMEOUT
         wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": API_TIMEOUT})['result']['list'][0]
         equity = float(wb.get('totalEquity', 0) or 0)
         return f"Portfolio: {equity:.2f} USDT | Symbols: {len(SYMBOLS)} active"
@@ -380,7 +365,6 @@ def get_status() -> dict:
     
     # Equity
     try:
-        # Using the global API_TIMEOUT
         wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": API_TIMEOUT})["result"]["list"][0]
         status["equity"] = float(wb.get("totalEquity", 0) or 0)
     except Exception as e:
@@ -389,7 +373,6 @@ def get_status() -> dict:
     for sym in SYMBOLS:
         # Positions
         try:
-            # Using the global API_TIMEOUT
             pos_list = session.get_position(category="linear", symbol=sym, **{"timeout": API_TIMEOUT})["result"]["list"]
             if pos_list:
                 p = pos_list[0]
@@ -405,7 +388,6 @@ def get_status() -> dict:
             
         # Open orders
         try:
-            # Using the global API_TIMEOUT
             oo = session.get_open_orders(category="linear", symbol=sym, **{"timeout": API_TIMEOUT})["result"]["list"]
             status["open_orders"][sym] = len(oo)
         except:
@@ -415,10 +397,9 @@ def get_status() -> dict:
         try:
             df = fetch_data(sym)
             cur = float(df['close'].iloc[-1])
-            pred = predict_price(df) # Predict price returns a standard Python float
+            pred = predict_price(df) 
             lev, risk_score, state, tp, sl, gate = assess_risk(df, sym, total_trade_counts.get(sym, 0))
             status["signals"][sym] = {
-                # Ensure all numerical values are explicitly converted/rounded to standard float/int
                 "delta_pct": float(round((pred/cur - 1)*100, 3)),
                 "risk_score": float(round(risk_score, 3)),
                 "state": state,
@@ -444,13 +425,12 @@ def start_health_server():
                 try:
                     st = get_status()
                     self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
-                    # Use the corrected SafeJSONEncoder here
                     self.wfile.write(json.dumps(st, indent=2, cls=SafeJSONEncoder).encode())
                 except Exception as e:
                     self.send_response(500); self.end_headers(); self.wfile.write(f"Status error: {e}".encode())
             else:
                 self.send_response(404); self.end_headers()
-        def log_message(self, *a, **k): pass # Suppress default logging
+        def log_message(self, *a, **k): pass 
         
     try:
         port = int(os.getenv("PORT", "10000"))
@@ -473,10 +453,9 @@ def execute_trade(symbol: str, action: str, qty: float, leverage: int,
         # Crucially, ensure leverage is passed as a string
         session.set_leverage(category="linear", symbol=symbol,
                              buy_leverage=str(leverage), sell_leverage=str(leverage), 
-                             **{"timeout": API_TIMEOUT}) # Use global timeout
+                             **{"timeout": API_TIMEOUT}) 
     except InvalidRequestError as e:
         # Ignore specific error code 110043 ("no position to set leverage")
-        # which can occur on fresh symbols. The bot will try again next time.
         if "110043" in str(e): 
             logging.info(f"Leverage set skipped for {symbol}: No active position yet.")
         else:
@@ -491,13 +470,13 @@ def execute_trade(symbol: str, action: str, qty: float, leverage: int,
         order = session.place_order(
             category="linear", symbol=symbol, side=side,
             order_type="Market", qty=str(qty),
-            positionIdx=0, reduce_only=False, **{"timeout": API_TIMEOUT} # Use global timeout
+            positionIdx=0, reduce_only=False, **{"timeout": API_TIMEOUT} 
         )
     except TypeError:
-        order = session.place_order( # Fallback for older client libraries
+        order = session.place_order(
             category="linear", symbol=symbol, side=side,
             order_type="Market", qty=str(qty),
-            positionIdx=0, reduceOnly=False, **{"timeout": API_TIMEOUT} # Use global timeout
+            positionIdx=0, reduceOnly=False, **{"timeout": API_TIMEOUT} 
         )
         
     if order.get('retCode', 1) != 0:
@@ -527,13 +506,13 @@ def close_position(symbol: str, open_side: str, qty: float,
         order = session.place_order(
             category="linear", symbol=symbol, side=exit_side,
             order_type="Market", qty=str(qty),
-            positionIdx=0, reduce_only=True, **{"timeout": API_TIMEOUT} # Use global timeout
+            positionIdx=0, reduce_only=True, **{"timeout": API_TIMEOUT} 
         )
     except TypeError:
         order = session.place_order(
             category="linear", symbol=symbol, side=exit_side,
             order_type="Market", qty=str(qty),
-            positionIdx=0, reduceOnly=True, **{"timeout": API_TIMEOUT} # Use global timeout
+            positionIdx=0, reduceOnly=True, **{"timeout": API_TIMEOUT} 
         )
         
     if order.get('retCode', 1) != 0:
@@ -577,7 +556,6 @@ def boot_diag():
     logging.info("=== BOOT DIAG START (Multi-Symbol) ===")
     logging.info(f"TESTNET={TESTNET} SYMBOLS={SYMBOLS} BOT_PAUSED={BOT_PAUSED} RISK_PER_TRADE={RISK_PER_TRADE*100:.2f}%")
     try:
-        # Using the global API_TIMEOUT
         wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": API_TIMEOUT})['result']['list'][0]
         global initial_balance
         initial_balance = float(wb.get('totalEquity', 0) or 0)
@@ -586,7 +564,6 @@ def boot_diag():
         logging.warning(f"Wallet Check: error: {e}")
     for sym in SYMBOLS[:2]:
         try:
-            # Using the global API_TIMEOUT
             k = session.get_kline(category='linear', symbol=sym, interval='15', limit=2, **{"timeout": API_TIMEOUT})['result']['list']
             logging.info(f"Kline Check {sym}: last_close={float(k[-1][4]):.2f}")
         except Exception as e:
@@ -598,7 +575,6 @@ def adopt_open_positions():
     try:
         for sym in SYMBOLS:
             try:
-                # Using the global API_TIMEOUT
                 pos_list = session.get_position(category="linear", symbol=sym, **{"timeout": API_TIMEOUT})["result"]["list"]
             except Exception:
                 pos_list = []
@@ -627,7 +603,6 @@ def main():
     
     # Get initial balance for risk calculation
     try:
-        # Using the global API_TIMEOUT
         wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": API_TIMEOUT})["result"]["list"][0]
         balance = float(wb.get("totalEquity", 0) or 0)
     except Exception:
@@ -687,7 +662,6 @@ def main():
                 
                 # Update current balance for accurate sizing
                 try:
-                    # Using the global API_TIMEOUT
                     wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": API_TIMEOUT})["result"]["list"][0]
                     balance = float(wb.get("totalEquity", 0) or 0)
                 except Exception:
@@ -712,8 +686,8 @@ def main():
                         # Close position and update Q-table with reward
                         ok, reward = close_position(symbol, open_side, qty, entry_price, entry_time, reason, current_price)
                         if ok:
-                            cumulative_pnl += reward * (qty * entry_price) # Add raw P&L
-                            update_q(symbol, reward, state_at_entry, lev_used) # RL update
+                            cumulative_pnl += reward * (qty * entry_price) 
+                            update_q(symbol, reward, state_at_entry, lev_used) 
                             open_positions.pop(symbol)
                         continue
 
@@ -743,7 +717,6 @@ def main():
 
                 if action:
                     try:
-                        # Using the global API_TIMEOUT
                         info = session.get_instruments_info(category="linear", symbol=symbol, **{"timeout": API_TIMEOUT})["result"]["list"][0]
                         min_qty = float(info["lotSizeFilter"]["minOrderQty"])
                         qty_step = float(info["lotSizeFilter"]["qtyStep"])
@@ -757,7 +730,6 @@ def main():
                     risk_amount = balance * RISK_PER_TRADE
 
                     # 2. Calculate Stop Loss Distance in Price ($ per unit)
-                    # sl_pct comes from adaptive_thresholds
                     stop_loss_dist_price = current_price * sl_pct
                     if stop_loss_dist_price <= 0:
                         logging.warning(f"Skip {symbol}: invalid SL distance {stop_loss_dist_price}")
@@ -767,7 +739,6 @@ def main():
                     raw_qty_risk = risk_amount / stop_loss_dist_price
                     
                     # 4. Apply Notional Exposure Cap (sanity check)
-                    # Cap notional based on max leverage and soft margin percentage (BASE_POSITION_PCT)
                     max_notional_cap = balance * LEVERAGE_MAX * BASE_POSITION_PCT
                     raw_qty_cap = max_notional_cap / max(1e-9, current_price)
 
@@ -794,7 +765,6 @@ def main():
                             f"or Qty {qty:.6f} < min {min_qty:.6f}"
                         )
                 else:
-                    # Log when no signal is found
                     logging.info(
                         f"No entry {symbol}: Δ={delta_pct:.2f}% risk={risk_score:.2f} "
                         f"rsi={rsi:.2f} px={current_price:.2f} ma50={ma50:.2f} "
@@ -807,7 +777,6 @@ def main():
 
             # Global drawdown guard
             try:
-                # Using the global API_TIMEOUT
                 wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": API_TIMEOUT})["result"]["list"][0]
                 balance = float(wb.get("totalEquity", 0) or 0)
             except Exception:
