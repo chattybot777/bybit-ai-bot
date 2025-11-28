@@ -13,6 +13,8 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.ensemble import GradientBoostingRegressor
 from tenacity import retry, stop_after_attempt, wait_exponential
 from http.server import BaseHTTPRequestHandler, HTTPServer
+# --- NEW: Import Pybit exceptions for targeted error handling ---
+from pybit.unified_trading.exceptions import InvalidRequestError 
 
 
 class SafeJSONEncoder(json.JSONEncoder):
@@ -54,24 +56,16 @@ def sanitize_env_var(value: str) -> str:
 
 
 # API Keys and Setup 
-# NOTE: We now explicitly use the new environment variable names for the key/secret 
-# that the Start Command maps to BYBIT_API_KEY and BYBIT_API_SECRET respectively.
 API_KEY = sanitize_env_var(os.getenv("BYBIT_API_KEY", "")) 
 API_SECRET = sanitize_env_var(os.getenv("BYBIT_API_SECRET") or os.getenv("API_SECRET") or "")
 
 # --- Diagnostic Logging (Safety Check) ---
-# Log the length of the sanitized key/secret to confirm cleanup
+# We know the key is good now, but keep this for internal diagnosis
 logging.info(f"Auth Check: API_KEY length={len(API_KEY)} (Sanitized)")
 logging.info(f"Auth Check: API_SECRET length={len(API_SECRET)} (Sanitized)")
-if not API_KEY or not API_SECRET:
-    logging.critical("API credentials are empty after sanitization. Check Render environment variables!")
 # ----------------------------------------
 
-# The rest of the globals and functions remain the same...
-
 TESTNET = (os.getenv("BYBIT_TESTNET") or os.getenv("TESTNET") or "true").lower() in ("1","true","yes")
-# REDUCED RECV_WINDOW: 60000ms (60s) is too high for a normal connection and might hide issues.
-# A standard value for a reliable connection is 5000ms.
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "5000")) 
 
 # Bot Controls & Risk Management
@@ -102,14 +96,18 @@ VOL_CAP      = float(os.getenv("VOL_CAP", "0.20"))          # cap 15m vol at 20%
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# --- GLOBAL API TIMEOUT (Increased to 15s for greater network stability) ---
+API_TIMEOUT = 15
+
 # Initialize Bybit Session
 session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET, recv_window=RECV_WINDOW)
 
 # -------- Symbols --------
 def get_top_symbols() -> List[str]:
-    """Fetches top 10 USDT symbols by 24h turnover from Bybit. REDUCED TO TOP 3."""
+    """Fetches top 3 USDT symbols by 24h turnover from Bybit."""
     try:
-        r = session.get_tickers(category="linear")["result"]["list"]
+        # Using the global API_TIMEOUT
+        r = session.get_tickers(category="linear", **{"timeout": API_TIMEOUT})["result"]["list"]
         usdt = [t for t in r if t.get("symbol","").endswith("USDT")]
         cleaned = []
         for t in usdt:
@@ -196,8 +194,8 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def fetch_data(symbol: str) -> pd.DataFrame:
     """Fetches kline data and computes required indicators (RSI, MA50, Volatility)."""
-    # Increased timeout to 10 seconds for the kline request
-    r = session.get_kline(category="linear", symbol=symbol, interval="15", limit=200, **{"timeout": 10}) 
+    # Using the global API_TIMEOUT
+    r = session.get_kline(category="linear", symbol=symbol, interval="15", limit=200, **{"timeout": API_TIMEOUT}) 
     rows = r["result"]["list"]
     cols = ["start", "open", "high", "low", "close", "volume", "turnover"]
     df = pd.DataFrame(rows, columns=cols)
@@ -349,7 +347,7 @@ def send_telegram(msg: str):
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         try:
             requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                         params={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=15)
+                         params={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=API_TIMEOUT) # Use global timeout
         except Exception as e:
             logging.warning(f"Telegram error: {e}")
 
@@ -362,7 +360,8 @@ def quantize(value: float, step: float, minimum: float) -> float:
 def get_portfolio_summary() -> str:
     """Fetches a quick summary of current equity."""
     try:
-        wb = session.get_wallet_balance(accountType="UNIFIED")['result']['list'][0]
+        # Using the global API_TIMEOUT
+        wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": API_TIMEOUT})['result']['list'][0]
         equity = float(wb.get('totalEquity', 0) or 0)
         return f"Portfolio: {equity:.2f} USDT | Symbols: {len(SYMBOLS)} active"
     except:
@@ -381,7 +380,8 @@ def get_status() -> dict:
     
     # Equity
     try:
-        wb = session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]
+        # Using the global API_TIMEOUT
+        wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": API_TIMEOUT})["result"]["list"][0]
         status["equity"] = float(wb.get("totalEquity", 0) or 0)
     except Exception as e:
         status["equity"] = f"error: {e}"
@@ -389,7 +389,8 @@ def get_status() -> dict:
     for sym in SYMBOLS:
         # Positions
         try:
-            pos_list = session.get_position(category="linear", symbol=sym)["result"]["list"]
+            # Using the global API_TIMEOUT
+            pos_list = session.get_position(category="linear", symbol=sym, **{"timeout": API_TIMEOUT})["result"]["list"]
             if pos_list:
                 p = pos_list[0]
                 size = float(p.get("size", 0) or 0)
@@ -404,7 +405,8 @@ def get_status() -> dict:
             
         # Open orders
         try:
-            oo = session.get_open_orders(category="linear", symbol=sym)["result"]["list"]
+            # Using the global API_TIMEOUT
+            oo = session.get_open_orders(category="linear", symbol=sym, **{"timeout": API_TIMEOUT})["result"]["list"]
             status["open_orders"][sym] = len(oo)
         except:
             status["open_orders"][sym] = 0
@@ -465,13 +467,23 @@ def execute_trade(symbol: str, action: str, qty: float, leverage: int,
     """Executes a market entry trade (long/short)."""
     # 1. Set leverage (must be done before order)
     leverage = int(max(LEVERAGE_MIN, min(leverage, LEVERAGE_MAX)))
+    
+    # --- HARDENED LEVERAGE SETTING LOGIC ---
     try:
-        # Increased timeout to 10 seconds for the leverage setting
+        # Crucially, ensure leverage is passed as a string
         session.set_leverage(category="linear", symbol=symbol,
-                             buy_leverage=str(leverage), sell_leverage=str(leverage), **{"timeout": 10})
-    except Exception as e:
-        if "110043" not in str(e): # Ignore 'no position' error if setting leverage
+                             buy_leverage=str(leverage), sell_leverage=str(leverage), 
+                             **{"timeout": API_TIMEOUT}) # Use global timeout
+    except InvalidRequestError as e:
+        # Ignore specific error code 110043 ("no position to set leverage")
+        # which can occur on fresh symbols. The bot will try again next time.
+        if "110043" in str(e): 
+            logging.info(f"Leverage set skipped for {symbol}: No active position yet.")
+        else:
             logging.error(f"Leverage set error for {symbol}: {e}")
+            
+    except Exception as e:
+        logging.error(f"General Leverage set error for {symbol}: {e}")
             
     # 2. Place market order
     side = "Buy" if action == "long" else "Sell"
@@ -479,13 +491,13 @@ def execute_trade(symbol: str, action: str, qty: float, leverage: int,
         order = session.place_order(
             category="linear", symbol=symbol, side=side,
             order_type="Market", qty=str(qty),
-            positionIdx=0, reduce_only=False, **{"timeout": 10} # Increased timeout
+            positionIdx=0, reduce_only=False, **{"timeout": API_TIMEOUT} # Use global timeout
         )
     except TypeError:
         order = session.place_order( # Fallback for older client libraries
             category="linear", symbol=symbol, side=side,
             order_type="Market", qty=str(qty),
-            positionIdx=0, reduceOnly=False, **{"timeout": 10} # Increased timeout
+            positionIdx=0, reduceOnly=False, **{"timeout": API_TIMEOUT} # Use global timeout
         )
         
     if order.get('retCode', 1) != 0:
@@ -515,13 +527,13 @@ def close_position(symbol: str, open_side: str, qty: float,
         order = session.place_order(
             category="linear", symbol=symbol, side=exit_side,
             order_type="Market", qty=str(qty),
-            positionIdx=0, reduce_only=True, **{"timeout": 10} # Increased timeout
+            positionIdx=0, reduce_only=True, **{"timeout": API_TIMEOUT} # Use global timeout
         )
     except TypeError:
         order = session.place_order(
             category="linear", symbol=symbol, side=exit_side,
             order_type="Market", qty=str(qty),
-            positionIdx=0, reduceOnly=True, **{"timeout": 10} # Increased timeout
+            positionIdx=0, reduceOnly=True, **{"timeout": API_TIMEOUT} # Use global timeout
         )
         
     if order.get('retCode', 1) != 0:
@@ -565,8 +577,8 @@ def boot_diag():
     logging.info("=== BOOT DIAG START (Multi-Symbol) ===")
     logging.info(f"TESTNET={TESTNET} SYMBOLS={SYMBOLS} BOT_PAUSED={BOT_PAUSED} RISK_PER_TRADE={RISK_PER_TRADE*100:.2f}%")
     try:
-        # Wallet balance check using a 10-second timeout
-        wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": 10})['result']['list'][0]
+        # Using the global API_TIMEOUT
+        wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": API_TIMEOUT})['result']['list'][0]
         global initial_balance
         initial_balance = float(wb.get('totalEquity', 0) or 0)
         logging.info(f"Wallet Check: equity={initial_balance:.6f}")
@@ -574,8 +586,8 @@ def boot_diag():
         logging.warning(f"Wallet Check: error: {e}")
     for sym in SYMBOLS[:2]:
         try:
-            # Kline check using a 10-second timeout
-            k = session.get_kline(category='linear', symbol=sym, interval='15', limit=2, **{"timeout": 10})['result']['list']
+            # Using the global API_TIMEOUT
+            k = session.get_kline(category='linear', symbol=sym, interval='15', limit=2, **{"timeout": API_TIMEOUT})['result']['list']
             logging.info(f"Kline Check {sym}: last_close={float(k[-1][4]):.2f}")
         except Exception as e:
             logging.warning(f"Kline Check {sym}: {e}")
@@ -586,8 +598,8 @@ def adopt_open_positions():
     try:
         for sym in SYMBOLS:
             try:
-                # Position check using a 10-second timeout
-                pos_list = session.get_position(category="linear", symbol=sym, **{"timeout": 10})["result"]["list"]
+                # Using the global API_TIMEOUT
+                pos_list = session.get_position(category="linear", symbol=sym, **{"timeout": API_TIMEOUT})["result"]["list"]
             except Exception:
                 pos_list = []
             if pos_list:
@@ -597,6 +609,7 @@ def adopt_open_positions():
                     side = p.get("side")
                     avg = float(p.get("avgPrice", 0) or 0)
                     try:
+                        # Ensure leverage parsing is safe
                         lev = int(float(p.get("leverage", LEVERAGE_MIN)))
                     except Exception:
                         lev = LEVERAGE_MIN
@@ -614,7 +627,8 @@ def main():
     
     # Get initial balance for risk calculation
     try:
-        wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": 10})["result"]["list"][0]
+        # Using the global API_TIMEOUT
+        wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": API_TIMEOUT})["result"]["list"][0]
         balance = float(wb.get("totalEquity", 0) or 0)
     except Exception:
         balance = 1000.0
@@ -673,7 +687,8 @@ def main():
                 
                 # Update current balance for accurate sizing
                 try:
-                    wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": 10})["result"]["list"][0]
+                    # Using the global API_TIMEOUT
+                    wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": API_TIMEOUT})["result"]["list"][0]
                     balance = float(wb.get("totalEquity", 0) or 0)
                 except Exception:
                     balance = initial_balance
@@ -728,7 +743,8 @@ def main():
 
                 if action:
                     try:
-                        info = session.get_instruments_info(category="linear", symbol=symbol, **{"timeout": 10})["result"]["list"][0]
+                        # Using the global API_TIMEOUT
+                        info = session.get_instruments_info(category="linear", symbol=symbol, **{"timeout": API_TIMEOUT})["result"]["list"][0]
                         min_qty = float(info["lotSizeFilter"]["minOrderQty"])
                         qty_step = float(info["lotSizeFilter"]["qtyStep"])
                     except Exception as e:
@@ -791,7 +807,8 @@ def main():
 
             # Global drawdown guard
             try:
-                wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": 10})["result"]["list"][0]
+                # Using the global API_TIMEOUT
+                wb = session.get_wallet_balance(accountType="UNIFIED", **{"timeout": API_TIMEOUT})["result"]["list"][0]
                 balance = float(wb.get("totalEquity", 0) or 0)
             except Exception:
                 balance = initial_balance
