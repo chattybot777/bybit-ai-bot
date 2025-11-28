@@ -4,9 +4,8 @@ python-dotenv
 requests
 tenacity
 
-# ML/Data Science - Forces use of pre-built Linux packages (Wheels) to bypass compilation issues.
-# This ensures a faster and more stable build on platforms like Render.
-torch==2.0.1+cpu -f https://download.pytorch.org/whl/torch_stable.html
+# ML/Data Science - Using simple version pins to ensure a stable build.
+torch==2.0.1
 numpy==1.24.4
 pandas==2.0.3
 scikit-learn==1.3.0
