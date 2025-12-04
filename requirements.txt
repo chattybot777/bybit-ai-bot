@@ -1,15 +1,4 @@
-# FIX 1: Use specific URLs to bypass failed PyPI lookup for torch/torchvision on Render's build environment (CPU only).
-# This link specifies Python 3.10 (cp310) and CPU architecture (linux_x86_64).
-torch @ https://download.pytorch.org/whl/cpu/torch-2.0.1%2Bcpu-cp310-cp310-linux_x86_64.whl
-torchvision @ https://download.pytorch.org/whl/cpu/torchvision-0.15.2%2Bcpu-cp310-cp310-linux_x86_64.whl
-
-# Core Trading & Utils
 pybit>=5.0.0
 python-dotenv
 requests
 tenacity
-
-# ML/Data Science - Standard dependencies
-numpy==1.24.4
-pandas==2.0.3
-scikit-learn==1.3.0
