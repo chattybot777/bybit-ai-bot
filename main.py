@@ -1,6 +1,6 @@
 # === Bybit AI Trading Bot: Single-File Production Version ===
 # Architecture: Monolithic (All-in-One) for Deployment Stability
-# Logic: Risk-First Sizing + Gradient Boosting (GB) + RSI
+# Logic: Risk-First Sizing + Gradient Boosting (GB) + RSI + Q-Learning (RL)
 # Platform: Render.com
 
 import os
@@ -12,6 +12,7 @@ import threading
 import json
 import numpy as np
 import pandas as pd
+import random
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
@@ -38,7 +39,7 @@ SYMBOL_LIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT"] # Start with top 3 for stability
 TIMEFRAME = "15" # 15-minute candles
 RISK_PER_TRADE = 0.005 # 0.5% equity risk per trade
 MAX_LEVERAGE = 10
-LEVERAGE = 10 # Default leverage
+# MIN_LEVERAGE = 1
 SL_ATR_MULTIPLIER = 2.0 # Stop Loss distance = 2x ATR
 TP_ATR_MULTIPLIER = 3.0 # Take Profit distance = 3x ATR
 
@@ -51,6 +52,7 @@ bot_state = {
     "equity": 0.0,
     "active_symbols": SYMBOL_LIST,
     "positions": {},
+    "q_table": {}, # Stores RL knowledge
     "last_update": 0
 }
 
@@ -74,6 +76,44 @@ def start_server():
     server = HTTPServer(('0.0.0.0', port), HealthHandler)
     logger.info(f"Health server started on port {port}")
     server.serve_forever()
+
+# --- REINFORCEMENT LEARNING ENGINE (The Brain) ---
+def get_market_state(volatility):
+    # Classify market state based on volatility
+    if volatility < 0.005: return 'low_vol'
+    if volatility < 0.015: return 'med_vol'
+    return 'high_vol'
+
+def choose_leverage(symbol, state, epsilon=0.1):
+    # Initialize Q-table for symbol if missing
+    if symbol not in bot_state['q_table']:
+        bot_state['q_table'][symbol] = {
+            'low_vol': [0.0] * MAX_LEVERAGE,
+            'med_vol': [0.0] * MAX_LEVERAGE,
+            'high_vol': [0.0] * MAX_LEVERAGE
+        }
+    
+    # Epsilon-Greedy Strategy: Exploration vs Exploitation
+    if random.random() < epsilon:
+        # Explore: Random leverage
+        lev = random.randint(1, MAX_LEVERAGE)
+    else:
+        # Exploit: Best known leverage for this state
+        q_values = bot_state['q_table'][symbol][state]
+        lev = int(np.argmax(q_values) + 1)
+    
+    return lev
+
+def update_q_table(symbol, state, leverage, reward):
+    # Q-Learning Update Rule
+    # Q(s,a) = Q(s,a) + alpha * (reward - Q(s,a))
+    alpha = 0.1 # Learning rate
+    
+    if symbol in bot_state['q_table']:
+        current_q = bot_state['q_table'][symbol][state][leverage-1]
+        new_q = current_q + alpha * (reward - current_q)
+        bot_state['q_table'][symbol][state][leverage-1] = new_q
+        logger.info(f"RL UPDATE: {symbol} State={state} Lev={leverage}x Reward={reward:.4f} NewQ={new_q:.4f}")
 
 # --- DATA & ML ENGINE ---
 def calculate_indicators(df):
@@ -127,6 +167,7 @@ class TradingBot:
     def __init__(self):
         self.session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
         self.check_credentials()
+        self.previous_equity = 0.0
 
     def check_credentials(self):
         try:
@@ -162,34 +203,31 @@ class TradingBot:
             logger.error(f"Failed to get balance: {e}")
             return 0.0
 
-    def set_leverage_safe(self, symbol):
+    def set_leverage_safe(self, symbol, leverage):
         try:
-            self.session.set_leverage(category="linear", symbol=symbol, buy_leverage=str(LEVERAGE), sell_leverage=str(LEVERAGE))
+            self.session.set_leverage(category="linear", symbol=symbol, buy_leverage=str(leverage), sell_leverage=str(leverage))
         except InvalidRequestError as e:
             # Ignore "leverage not modified" error
             if "110043" not in str(e) and "34036" not in str(e):
                 logger.warning(f"Leverage set warning: {e}")
 
-    def execute_trade(self, symbol, side, entry_price, sl_dist):
+    def execute_trade(self, symbol, side, entry_price, sl_dist, leverage):
         # RISK MANAGEMENT: Calculate Size based on Risk Amount
         equity = self.get_balance()
         risk_amt = equity * RISK_PER_TRADE
         
         # Quantity = Risk $ / Distance to Stop Loss $
-        # e.g., Risk $50 / SL distance $100 = 0.5 BTC
         if sl_dist == 0: return
         
         qty = risk_amt / sl_dist
         
-        # Rounding/Minimizing (Simplified for stability)
-        # Fetch instrument info to get precision (omitted for brevity, assuming standard formatting)
-        # For now, we format to 3 decimals to be safe for major pairs
+        # Format to 3 decimals 
         qty_str = f"{qty:.3f}"
         
-        logger.info(f"SIGNAL: {symbol} {side} | Equity: {equity} | Risk: {risk_amt} | Qty: {qty_str}")
+        logger.info(f"SIGNAL: {symbol} {side} | Equity: {equity} | Risk: {risk_amt} | Qty: {qty_str} | Lev: {leverage}x")
         
         try:
-            self.set_leverage_safe(symbol)
+            self.set_leverage_safe(symbol, leverage)
             self.session.place_order(
                 category="linear",
                 symbol=symbol,
@@ -200,12 +238,26 @@ class TradingBot:
                 takeProfit=f"{(entry_price + sl_dist * 1.5):.2f}" if side == "Buy" else f"{(entry_price - sl_dist * 1.5):.2f}"
             )
             logger.info(f"ORDER PLACED: {symbol} {side} {qty_str}")
+            return True
         except Exception as e:
             logger.error(f"Order failed: {e}")
+            return False
 
     def run(self):
         logger.info("Starting Main Trading Loop...")
+        self.previous_equity = self.get_balance()
+        
         while True:
+            # 1. Check Portfolio Performance (Reward Calculation)
+            current_equity = self.get_balance()
+            pnl_change = current_equity - self.previous_equity
+            self.previous_equity = current_equity
+            
+            # Simple reward attribution: Positive PnL = +1, Negative = -1
+            # In a real system, you'd attribute this to specific closed trades,
+            # but for a portfolio bot, total equity change is the ultimate truth.
+            reward = 1.0 if pnl_change > 0 else (-1.0 if pnl_change < 0 else 0.0)
+
             for symbol in SYMBOL_LIST:
                 try:
                     df = self.fetch_data(symbol)
@@ -215,19 +267,28 @@ class TradingBot:
                     predicted_price = train_and_predict(df)
                     atr = df['atr'].iloc[-1]
                     rsi = df['rsi'].iloc[-1]
+                    vol = df['volatility'].iloc[-1]
                     
-                    # LOGIC:
-                    # 1. Prediction > Current Price + Threshold
-                    # 2. RSI is not overbought (>70)
+                    # RL Step 1: Determine Market State
+                    market_state = get_market_state(vol)
+                    
+                    # RL Step 2: Choose Leverage based on experience in this state
+                    leverage = choose_leverage(symbol, market_state)
+                    
+                    # RL Step 3: Update Q-Table from PREVIOUS actions results (using Portfolio PnL)
+                    # We update the *current* state/leverage pair with the recent global reward
+                    # This is a simplification for stability: "Did the bot make money recently? Yes -> This lev is good."
+                    if pnl_change != 0:
+                        update_q_table(symbol, market_state, leverage, reward)
+
+                    # SIGNAL LOGIC
                     threshold = current_price * 0.002 # 0.2% predicted move required
                     
                     if predicted_price > (current_price + threshold) and rsi < 70:
-                        # LONG SIGNAL
-                        self.execute_trade(symbol, "Buy", current_price, atr * SL_ATR_MULTIPLIER)
+                        self.execute_trade(symbol, "Buy", current_price, atr * SL_ATR_MULTIPLIER, leverage)
                         
                     elif predicted_price < (current_price - threshold) and rsi > 30:
-                        # SHORT SIGNAL
-                        self.execute_trade(symbol, "Sell", current_price, atr * SL_ATR_MULTIPLIER)
+                        self.execute_trade(symbol, "Sell", current_price, atr * SL_ATR_MULTIPLIER, leverage)
                         
                     else:
                         logger.info(f"{symbol}: No Signal (Pred: {predicted_price:.2f} | Cur: {current_price:.2f})")
