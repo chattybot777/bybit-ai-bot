@@ -1,6 +1,7 @@
 # === Bybit AI Trading Bot: Single-File Production Version ===
 # Architecture: Monolithic (All-in-One) for Deployment Stability
 # Logic: Risk-First Sizing + Gradient Boosting (GB) + RSI + Q-Learning
+# Fixes: Minimum Order Size Enforcement + Correct Imports
 # Platform: Render.com
 
 import os
@@ -16,6 +17,7 @@ import random
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
+# FIX: Correct import path for pybit exceptions
 from pybit.exceptions import InvalidRequestError
 from tenacity import retry, stop_after_attempt, wait_exponential
 from sklearn.ensemble import GradientBoostingRegressor
@@ -68,7 +70,7 @@ def start_server():
     port = int(os.getenv("PORT", 10000))
     HTTPServer(('0.0.0.0', port), HealthHandler).serve_forever()
 
-# --- REINFORCEMENT LEARNING (Q-Table) ---
+# --- REINFORCEMENT LEARNING ---
 def get_market_state(volatility):
     if volatility < 0.005: return 'low_vol'
     if volatility < 0.015: return 'med_vol'
@@ -93,20 +95,17 @@ def update_q_table(symbol, state, leverage, reward):
 
 # --- DATA & ML ENGINE ---
 def calculate_indicators(df):
-    # RSI (14)
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
     
-    # ATR (14)
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
     df['atr'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
     
-    # ML Features
     df['returns'] = df['close'].pct_change()
     df['volatility'] = df['returns'].rolling(20).std()
     return df.dropna()
@@ -130,12 +129,28 @@ def train_and_predict(df):
 class TradingBot:
     def __init__(self):
         self.session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
+        self.symbol_info = {} # Stores min qty rules
         self.previous_equity = 0.0
         try:
             self.session.get_server_time()
             logger.info("Connected to Bybit.")
+            self.load_instrument_info()
         except Exception as e:
             logger.critical(f"Auth Failed: {e}"); sys.exit(1)
+
+    def load_instrument_info(self):
+        # Fetch rules for all symbols (min qty, precision, etc)
+        try:
+            r = self.session.get_instruments_info(category="linear")
+            for i in r['result']['list']:
+                if i['symbol'] in SYMBOL_LIST:
+                    self.symbol_info[i['symbol']] = {
+                        'min_qty': float(i['lotSizeFilter']['minOrderQty']),
+                        'qty_step': float(i['lotSizeFilter']['qtyStep']),
+                    }
+            logger.info(f"Loaded rules for {len(self.symbol_info)} symbols.")
+        except Exception as e:
+            logger.error(f"Failed to load instrument info: {e}")
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def fetch_data(self, symbol):
@@ -155,8 +170,30 @@ class TradingBot:
         risk_usd = equity * RISK_PER_TRADE
         if sl_dist <= 0: return
         
-        qty = float(f"{(risk_usd / sl_dist):.3f}")
-        logger.info(f"TRADE: {symbol} {side} | Lev: {lev}x | Qty: {qty} | Risk: ${risk_usd:.2f}")
+        # 1. Calculate ideal quantity based on risk
+        raw_qty = risk_usd / sl_dist
+        
+        # 2. Enforce Minimum Order Quantity (The Fix)
+        info = self.symbol_info.get(symbol)
+        if info:
+            min_qty = info['min_qty']
+            step = info['qty_step']
+            
+            # If calculated size is too small, bump it to the minimum
+            if raw_qty < min_qty:
+                # logger.warning(f"{symbol}: Risk qty {raw_qty:.4f} too small. Bumping to min {min_qty}")
+                raw_qty = min_qty
+            
+            # Round to correct step (e.g. 0.001)
+            qty = math.floor(raw_qty / step) * step
+            # Safe formatting for crypto
+            decimals = str(step)[::-1].find('.')
+            if decimals < 0: decimals = 0
+            qty_str = f"{qty:.{decimals}f}"
+        else:
+            qty_str = f"{raw_qty:.3f}"
+
+        logger.info(f"TRADE: {symbol} {side} | Lev: {lev}x | Qty: {qty_str} | Risk: ${risk_usd:.2f}")
         
         try:
             try: self.session.set_leverage(category="linear", symbol=symbol, buy_leverage=str(lev), sell_leverage=str(lev))
@@ -166,13 +203,14 @@ class TradingBot:
             tp_price = price + (sl_dist * TP_ATR_MULTIPLIER) if side == "Buy" else price - (sl_dist * TP_ATR_MULTIPLIER)
             
             self.session.place_order(
-                category="linear", symbol=symbol, side=side, orderType="Market", qty=str(qty),
+                category="linear", symbol=symbol, side=side, orderType="Market", qty=qty_str,
                 stopLoss=f"{sl_price:.2f}", takeProfit=f"{tp_price:.2f}"
             )
         except Exception as e:
             logger.error(f"Execution Failed: {e}")
 
     def run(self):
+        logger.info("Starting Main Trading Loop...")
         self.previous_equity = self.get_equity()
         while True:
             curr_eq = self.get_equity()
