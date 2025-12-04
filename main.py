@@ -81,13 +81,11 @@ def choose_leverage(symbol, state, epsilon=0.1):
     if random.random() < epsilon:
         return random.randint(1, MAX_LEVERAGE) # Explore
     else:
-        # Exploit (Choose index with max value, +1 for leverage 1-10)
         return int(np.argmax(bot_state['q_table'][symbol][state]) + 1)
 
 def update_q_table(symbol, state, leverage, reward):
     alpha = 0.1 # Learning rate
     if symbol in bot_state['q_table']:
-        # Map leverage 1..10 to index 0..9
         idx = max(0, min(leverage - 1, 9))
         current_q = bot_state['q_table'][symbol][state][idx]
         new_q = current_q + alpha * (reward - current_q)
@@ -114,14 +112,8 @@ def calculate_indicators(df):
     return df.dropna()
 
 def train_and_predict(df):
-    # We want to predict the 'close' of the NEXT candle.
-    # 1. Create a target column shifted by -1
     df['target'] = df['close'].shift(-1)
-    
-    # 2. Extract the VERY LAST row (current market state). This has features but NO target.
     current_features = df.iloc[-1][['rsi', 'volatility', 'returns', 'atr']].values.reshape(1, -1)
-    
-    # 3. Create training data (Drop the last row because it has no target)
     train_data = df.dropna()
     
     if len(train_data) < 50: return 0 
@@ -129,11 +121,9 @@ def train_and_predict(df):
     X = train_data[['rsi', 'volatility', 'returns', 'atr']].values
     y = train_data['target'].values
     
-    # 4. Train a fresh GB model instantly
     model = GradientBoostingRegressor(n_estimators=50, max_depth=3, random_state=42)
     model.fit(X, y)
     
-    # 5. Predict the FUTURE price using current features
     return model.predict(current_features)[0]
 
 # --- TRADING BOT ---
@@ -151,7 +141,6 @@ class TradingBot:
     def fetch_data(self, symbol):
         r = self.session.get_kline(category="linear", symbol=symbol, interval=TIMEFRAME, limit=200)
         if r['retCode'] != 0: raise Exception(r['retMsg'])
-        # Reverse to get chronological order (Oldest -> Newest)
         df = pd.DataFrame(r['result']['list'], columns=['ts','open','high','low','close','vol','to'])
         df = df.iloc[::-1].reset_index(drop=True)
         return df[['open','high','low','close']].astype(float)
@@ -166,17 +155,13 @@ class TradingBot:
         risk_usd = equity * RISK_PER_TRADE
         if sl_dist <= 0: return
         
-        # Sizing: Amount to buy = Risk / SL Distance
         qty = float(f"{(risk_usd / sl_dist):.3f}")
-        
         logger.info(f"TRADE: {symbol} {side} | Lev: {lev}x | Qty: {qty} | Risk: ${risk_usd:.2f}")
         
         try:
-            # Attempt to set leverage (ignore if already set)
             try: self.session.set_leverage(category="linear", symbol=symbol, buy_leverage=str(lev), sell_leverage=str(lev))
             except: pass
             
-            # Place Order with built-in TP/SL
             sl_price = price - sl_dist if side == "Buy" else price + sl_dist
             tp_price = price + (sl_dist * TP_ATR_MULTIPLIER) if side == "Buy" else price - (sl_dist * TP_ATR_MULTIPLIER)
             
@@ -190,7 +175,6 @@ class TradingBot:
     def run(self):
         self.previous_equity = self.get_equity()
         while True:
-            # Calc Reward (PnL Change)
             curr_eq = self.get_equity()
             reward = 1.0 if (curr_eq - self.previous_equity) > 0 else -1.0
             self.previous_equity = curr_eq
@@ -199,32 +183,26 @@ class TradingBot:
                 try:
                     df = self.fetch_data(sym)
                     df = calculate_indicators(df)
-                    
                     price = df['close'].iloc[-1]
                     pred = train_and_predict(df)
                     atr = df['atr'].iloc[-1]
                     vol = df['volatility'].iloc[-1]
                     rsi = df['rsi'].iloc[-1]
                     
-                    # RL Logic
                     state = get_market_state(vol)
                     lev = choose_leverage(sym, state)
                     if reward != 0: update_q_table(sym, state, lev, reward)
                     
-                    # Entry Logic (Pred + RSI filter)
-                    # Long: Pred > Price by 0.2% AND RSI not overbought
                     if pred > (price * 1.002) and rsi < 70:
                         self.execute(sym, "Buy", price, atr * SL_ATR_MULTIPLIER, lev)
-                    # Short: Pred < Price by 0.2% AND RSI not oversold
                     elif pred < (price * 0.998) and rsi > 30:
                         self.execute(sym, "Sell", price, atr * SL_ATR_MULTIPLIER, lev)
                     else:
-                        logger.info(f"{sym}: Wait. Pred:{pred:.2f} Cur:{price:.2f} Lev:{lev}x")
-                        
+                        logger.info(f"{sym}: Wait. Pred:{pred:.2f} Cur:{price:.2f}")
                 except Exception as e:
                     logger.error(f"Loop Error {sym}: {e}")
             
-            time.sleep(15) # Fast 15s loop
+            time.sleep(15)
 
 if __name__ == "__main__":
     threading.Thread(target=start_server, daemon=True).start()
