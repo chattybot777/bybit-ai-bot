@@ -16,7 +16,6 @@ import random
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
-# FIX: Correct import path for pybit exceptions
 from pybit.exceptions import InvalidRequestError
 from tenacity import retry, stop_after_attempt, wait_exponential
 from sklearn.ensemble import GradientBoostingRegressor
