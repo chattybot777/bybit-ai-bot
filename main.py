@@ -1,207 +1,199 @@
-# === Bybit AI Trading Bot: Single-File Production Version ===
-# Architecture: Monolithic (All-in-One) for Deployment Stability
-# Logic: Risk-First Sizing + Gradient Boosting (GB) + RSI + Q-Learning
-# Platform: Render.com
-
-import os
-import sys
-import time
-import math
-import logging
-import threading
-import json
-import numpy as np
+import ccxt
 import pandas as pd
-import random
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from dotenv import load_dotenv
-from pybit.unified_trading import HTTP
-from pybit.exceptions import InvalidRequestError
-from tenacity import retry, stop_after_attempt, wait_exponential
-from sklearn.ensemble import GradientBoostingRegressor
+import numpy as np
+import time
+import os
+import logging
+from datetime import datetime
 
-# --- CONFIGURATION ---
-load_dotenv()
-API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
-API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
-TESTNET = os.getenv("TESTNET", "true").lower() == "true"
-SYMBOL_LIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-TIMEFRAME = "15"
-RISK_PER_TRADE = 0.005 
-MAX_LEVERAGE = 10
-SL_ATR_MULTIPLIER = 2.0 
-TP_ATR_MULTIPLIER = 3.0
+# --- Configuration ---
+API_KEY = os.getenv('BYBIT_API_KEY')
+API_SECRET = os.getenv('BYBIT_API_SECRET')
+# Use 'linear' for USDT perpetuals on Bybit
+CATEGORY = 'linear' 
+SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'] 
+TIMEFRAME = '15m'
+LIMIT = 100
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+# Q-Learning Parameters
+ALPHA = 0.1  # Learning rate
+GAMMA = 0.9  # Discount factor
+EPSILON = 0.1 # Exploration rate
 
-bot_state = {"equity": 0.0, "active_symbols": SYMBOL_LIST, "positions": {}, "q_table": {}, "last_update": 0}
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()] # Print to console/Render logs
+)
+logger = logging.getLogger()
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/health":
-            self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
-        elif self.path == "/status":
-            self.send_response(200); self.send_header('Content-type', 'application/json'); self.end_headers()
-            self.wfile.write(json.dumps(json.loads(json.dumps(bot_state, default=str))).encode())
+# --- Exchange Connection ---
+def connect_exchange():
+    try:
+        exchange = ccxt.bybit({
+            'apiKey': API_KEY,
+            'secret': API_SECRET,
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'future', 
+                'adjustForTimeDifference': True,
+            }
+        })
+        # Check connection
+        exchange.load_markets()
+        logger.info("Connected to Bybit successfully.")
+        return exchange
+    except Exception as e:
+        logger.error(f"Failed to connect to Bybit: {e}")
+        return None
 
-def start_server():
-    port = int(os.getenv("PORT", 10000))
-    HTTPServer(('0.0.0.0', port), HealthHandler).serve_forever()
+# --- Data Fetching ---
+def fetch_data(exchange, symbol, timeframe='15m', limit=100):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
+    except Exception as e:
+        logger.error(f"Error fetching data for {symbol}: {e}")
+        return pd.DataFrame()
 
-def get_market_state(vol):
-    # FIX: Variable name corrected from 'volatility' to 'vol'
-    if vol < 0.005: return 'low'
-    if vol < 0.015: return 'med' 
-    return 'high'
-
-def choose_leverage(symbol, state, epsilon=0.1):
-    if symbol not in bot_state['q_table']:
-        bot_state['q_table'][symbol] = {'low': [0.0]*10, 'med': [0.0]*10, 'high': [0.0]*10}
-    if random.random() < epsilon: return random.randint(1, MAX_LEVERAGE)
-    return int(np.argmax(bot_state['q_table'][symbol][state]) + 1)
-
-def update_q(symbol, state, lev, reward):
-    alpha = 0.1 
-    if symbol in bot_state['q_table']:
-        idx = max(0, min(lev - 1, 9))
-        current_q = bot_state['q_table'][symbol][state][idx]
-        new_q = current_q + alpha * (reward - current_q)
-        bot_state['q_table'][symbol][state][idx] = new_q
-        logger.info(f"RL UPDATE: {symbol} State={state} Lev={leverage}x Reward={reward:.4f}")
-
-def calculate_indicators(df):
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
+# --- Technical Indicators (The 'State') ---
+def get_state(df):
+    if df.empty or len(df) < 26:
+        return 'unknown'
     
-    high_low = df['high'] - df['low']
-    high_close = np.abs(df['high'] - df['close'].shift())
-    low_close = np.abs(df['low'] - df['close'].shift())
-    df['atr'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
+    # Simple Moving Average Crossover State
+    df['SMA_12'] = df['close'].rolling(window=12).mean()
+    df['SMA_26'] = df['close'].rolling(window=26).mean()
     
-    df['returns'] = df['close'].pct_change()
-    df['volatility'] = df['returns'].rolling(20).std()
-    return df.dropna()
-
-def train_and_predict(df):
-    df['target'] = df['close'].shift(-1)
-    data = df.dropna()
-    if len(data) < 50: return 0 
-    X = data[['rsi', 'volatility', 'returns', 'atr']].values
-    y = data['target'].values
-    current_features = df.iloc[-1][['rsi', 'volatility', 'returns', 'atr']].values.reshape(1, -1)
+    latest = df.iloc[-1]
     
-    model = GradientBoostingRegressor(n_estimators=50, max_depth=3, random_state=42)
-    model.fit(X, y)
-    return model.predict(current_features)[0]
+    if latest['SMA_12'] > latest['SMA_26']:
+        return 'uptrend'
+    elif latest['SMA_12'] < latest['SMA_26']:
+        return 'downtrend'
+    else:
+        return 'neutral'
 
-class TradingBot:
-    def __init__(self):
-        self.session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
-        self.symbol_info = {}
-        self.previous_equity = 0.0
+# --- Q-Learning Logic ---
+
+# Initialize Q-table
+# State: uptrend, downtrend, neutral
+# Actions: 0 (Hold), 1 (Buy/Long), 2 (Sell/Short)
+q_table = {
+    'uptrend':   [0.0, 0.0, 0.0],
+    'downtrend': [0.0, 0.0, 0.0],
+    'neutral':   [0.0, 0.0, 0.0],
+    'unknown':   [0.0, 0.0, 0.0]
+}
+
+def choose_action(state):
+    # Epsilon-greedy strategy
+    if np.random.uniform(0, 1) < EPSILON:
+        return np.random.choice([0, 1, 2]) # Explore
+    else:
+        return np.argmax(q_table.get(state, [0,0,0])) # Exploit
+
+# THIS WAS MISSING PREVIOUSLY
+def update_q_table(state, action, reward, next_state):
+    """
+    Updates the Q-table using the Bellman equation.
+    """
+    try:
+        current_q = q_table[state][action]
+        max_future_q = np.max(q_table[next_state])
+        
+        # Bellman Equation
+        new_q = (1 - ALPHA) * current_q + ALPHA * (reward + GAMMA * max_future_q)
+        
+        q_table[state][action] = new_q
+        logger.info(f"Updated Q-table for {state}, action {action}: {new_q:.4f}")
+    except Exception as e:
+        logger.error(f"Error in update_q_table: {e}")
+
+def calculate_reward(entry_price, current_price, position_type):
+    if position_type == 'long':
+        return (current_price - entry_price) / entry_price
+    elif position_type == 'short':
+        return (entry_price - current_price) / entry_price
+    return 0
+
+# --- Execution Logic ---
+def execute_trade(exchange, symbol, action):
+    # This is a simplified execution for demonstration
+    # 0 = Hold, 1 = Buy, 2 = Sell
+    
+    # In a real bot, you would check current positions first using private API
+    # For now, we just log the intent
+    if action == 1:
+        logger.info(f"Signal: BUY {symbol}")
+        # exchange.create_market_buy_order(symbol, amount) <-- Real execution
+    elif action == 2:
+        logger.info(f"Signal: SELL {symbol}")
+        # exchange.create_market_sell_order(symbol, amount) <-- Real execution
+    else:
+        logger.info(f"Signal: HOLD {symbol}")
+
+# --- Main Loop ---
+def main():
+    exchange = connect_exchange()
+    if not exchange:
+        return
+
+    logger.info("Starting bot loop...")
+    
+    # Keep track of previous states to calculate rewards
+    previous_states = {symbol: 'unknown' for symbol in SYMBOLS}
+    previous_prices = {symbol: 0.0 for symbol in SYMBOLS}
+    last_actions = {symbol: 0 for symbol in SYMBOLS}
+
+    while True:
         try:
-            self.session.get_server_time()
-            logger.info("Connected to Bybit.")
-            self.load_instrument_info()
+            for symbol in SYMBOLS:
+                df = fetch_data(exchange, symbol, TIMEFRAME)
+                if df.empty:
+                    continue
+                
+                current_state = get_state(df)
+                current_price = df.iloc[-1]['close']
+                
+                # 1. Calculate Reward from PREVIOUS action (if any)
+                # (Simplified: assumes we entered at previous price)
+                prev_state = previous_states[symbol]
+                prev_action = last_actions[symbol]
+                
+                if prev_state != 'unknown':
+                    reward = 0
+                    if prev_action == 1: # Long
+                        reward = calculate_reward(previous_prices[symbol], current_price, 'long')
+                    elif prev_action == 2: # Short
+                        reward = calculate_reward(previous_prices[symbol], current_price, 'short')
+                    
+                    # 2. Update Q-Table based on what happened
+                    update_q_table(prev_state, prev_action, reward, current_state)
+
+                # 3. Decide NEW action
+                action = choose_action(current_state)
+                
+                # 4. Execute
+                execute_trade(exchange, symbol, action)
+                
+                # 5. Store state for next iteration
+                previous_states[symbol] = current_state
+                previous_prices[symbol] = current_price
+                last_actions[symbol] = action
+                
+            logger.info("Sleeping for 1 minute...")
+            time.sleep(60) # Run every minute
+
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user.")
+            break
         except Exception as e:
-            logger.critical(f"Auth Failed: {e}"); sys.exit(1)
-
-    def load_instrument_info(self):
-        try:
-            r = self.session.get_instruments_info(category="linear")
-            for i in r['result']['list']:
-                if i['symbol'] in SYMBOL_LIST:
-                    self.symbol_info[i['symbol']] = {
-                        'min_qty': float(i['lotSizeFilter']['minOrderQty']),
-                        'qty_step': float(i['lotSizeFilter']['qtyStep']),
-                    }
-            logger.info(f"Loaded rules for {len(self.symbol_info)} symbols.")
-        except Exception as e: logger.error(f"Info Load Failed: {e}")
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def fetch_data(self, symbol):
-        r = self.session.get_kline(category="linear", symbol=symbol, interval=TIMEFRAME, limit=200)
-        if r['retCode'] != 0: raise Exception(r['retMsg'])
-        df = pd.DataFrame(r['result']['list'], columns=['ts','open','high','low','close','vol','to'])
-        df = df.iloc[::-1].reset_index(drop=True)
-        return df[['open','high','low','close']].astype(float)
-
-    def get_equity(self):
-        r = self.session.get_wallet_balance(accountType="UNIFIED")
-        return float(r['result']['list'][0]['totalEquity'])
-
-    def execute(self, symbol, side, price, sl_dist, lev):
-        equity = self.get_equity()
-        bot_state['equity'] = equity
-        risk_usd = equity * RISK_PER_TRADE
-        if sl_dist <= 0: return
-        
-        raw_qty = risk_usd / sl_dist
-        info = self.symbol_info.get(symbol)
-        if info:
-            if raw_qty < info['min_qty']: raw_qty = info['min_qty']
-            step = info['qty_step']
-            qty = math.floor(raw_qty / step) * step
-            decimals = str(step)[::-1].find('.')
-            if decimals < 0: decimals = 0
-            qty_str = f"{qty:.{decimals}f}"
-        else:
-            qty_str = f"{raw_qty:.3f}"
-
-        logger.info(f"TRADE: {symbol} {side} | Lev: {lev}x | Qty: {qty_str} | Risk: ${risk_usd:.2f}")
-        
-        try:
-            try: self.session.set_leverage(category="linear", symbol=symbol, buy_leverage=str(lev), sell_leverage=str(lev))
-            except: pass
-            
-            sl_price = price - sl_dist if side == "Buy" else price + sl_dist
-            tp_price = price + (sl_dist * TP_ATR_MULTIPLIER) if side == "Buy" else price - (sl_dist * TP_ATR_MULTIPLIER)
-            
-            self.session.place_order(
-                category="linear", symbol=symbol, side=side, orderType="Market", qty=qty_str,
-                stopLoss=f"{sl_price:.2f}", takeProfit=f"{tp_price:.2f}"
-            )
-        except Exception as e: logger.error(f"Execution Failed: {e}")
-
-    def run(self):
-        logger.info("Starting Loop...")
-        try: self.previous_equity = self.get_equity()
-        except: self.previous_equity = 1000.0
-        
-        while True:
-            try:
-                curr_eq = self.get_equity()
-                reward = 1.0 if (curr_eq - self.previous_equity) > 0 else -1.0
-                self.previous_equity = curr_eq
-            except: pass
-            
-            for sym in SYMBOL_LIST:
-                try:
-                    df = self.fetch_data(sym)
-                    df = calculate_indicators(df)
-                    price = df['close'].iloc[-1]
-                    pred = train_and_predict(df)
-                    atr = df['atr'].iloc[-1]
-                    vol = df['volatility'].iloc[-1]
-                    rsi = df['rsi'].iloc[-1]
-                    
-                    state = get_market_state(vol)
-                    lev = choose_leverage(sym, state)
-                    if reward != 0: update_q_table(sym, state, lev, reward)
-                    
-                    if pred > (price * 1.002) and rsi < 70:
-                        self.execute(sym, "Buy", price, atr * SL_ATR_MULTIPLIER, lev)
-                    elif pred < (price * 0.998) and rsi > 30:
-                        self.execute(sym, "Sell", price, atr * SL_ATR_MULTIPLIER, lev)
-                    else:
-                        logger.info(f"{sym}: No Signal. Pred:{pred:.2f} Cur:{price:.2f}")
-                except Exception as e: logger.error(f"Loop Error {sym}: {e}")
-            time.sleep(15)
+            logger.error(f"Global Loop Error: {e}")
+            time.sleep(30) # Wait before retrying
 
 if __name__ == "__main__":
-    threading.Thread(target=start_server, daemon=True).start()
-    TradingBot().run()
+    main()
