@@ -1,7 +1,4 @@
-pybit>=5.0.0
+ccxt
+pandas
+numpy
 python-dotenv
-requests
-tenacity
-numpy==1.24.4
-pandas==2.0.3
-scikit-learn==1.3.0
