@@ -4,20 +4,18 @@ import numpy as np
 import time
 import os
 import logging
+import json
 from datetime import datetime
 
 # --- Configuration ---
 API_KEY = os.getenv('BYBIT_API_KEY')
 API_SECRET = os.getenv('BYBIT_API_SECRET')
-
-# SURGICAL FIX: Check Render Environment for TESTNET toggle
 USE_TESTNET = os.getenv('TESTNET', 'False').lower() == 'true'
 
-# Use 'linear' for USDT perpetuals on Bybit
 CATEGORY = 'linear' 
 SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'] 
 TIMEFRAME = '15m'
-LIMIT = 100
+LIMIT = 200 # Increased to ensure enough data for RSI
 
 # Q-Learning Parameters
 ALPHA = 0.1  # Learning rate
@@ -28,7 +26,7 @@ EPSILON = 0.1 # Exploration rate
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()] # Print to console/Render logs
+    handlers=[logging.StreamHandler()] 
 )
 logger = logging.getLogger()
 
@@ -39,172 +37,187 @@ def connect_exchange():
             'apiKey': API_KEY,
             'secret': API_SECRET,
             'enableRateLimit': True,
-            'options': {
-                'defaultType': 'future', 
-                'adjustForTimeDifference': True,
-            }
+            'options': { 'defaultType': 'future', 'adjustForTimeDifference': True }
         })
         
-        # SURGICAL FIX: Switch to Testnet only if configured
         if USE_TESTNET:
             exchange.set_sandbox_mode(True)
             logger.info("⚠️ RUNNING IN TESTNET MODE ⚠️")
         else:
             logger.info("RUNNING IN LIVE MODE")
 
-        # Check connection
         exchange.load_markets()
-        logger.info("Connected to Bybit successfully.")
         return exchange
     except Exception as e:
         logger.error(f"Failed to connect to Bybit: {e}")
         return None
 
 # --- Data Fetching ---
-def fetch_data(exchange, symbol, timeframe='15m', limit=100):
+def fetch_data(exchange, symbol):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=LIMIT)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception as e:
-        logger.error(f"Error fetching data for {symbol}: {e}")
+        logger.error(f"Error fetching data: {e}")
         return pd.DataFrame()
 
-# --- Technical Indicators (The 'State') ---
+# --- INTELLIGENCE UPGRADE: RSI Calculation ---
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0))
+    loss = (-delta.where(delta < 0, 0))
+    
+    # Use Exponential Moving Average for RSI (Standard)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# --- INTELLIGENCE UPGRADE: Advanced State ---
 def get_state(df):
-    if df.empty or len(df) < 26:
+    if df.empty or len(df) < 50:
         return 'unknown'
     
-    # Simple Moving Average Crossover State
+    # 1. Trend (SMA)
     df['SMA_12'] = df['close'].rolling(window=12).mean()
     df['SMA_26'] = df['close'].rolling(window=26).mean()
     
+    # 2. Momentum (RSI)
+    df['RSI'] = calculate_rsi(df['close'])
+    
     latest = df.iloc[-1]
     
+    # Determine Trend
     if latest['SMA_12'] > latest['SMA_26']:
-        return 'uptrend'
+        trend = 'uptrend'
     elif latest['SMA_12'] < latest['SMA_26']:
-        return 'downtrend'
+        trend = 'downtrend'
     else:
-        return 'neutral'
+        trend = 'neutral'
+        
+    # Determine Momentum
+    if latest['RSI'] > 70:
+        momentum = 'overbought'
+    elif latest['RSI'] < 30:
+        momentum = 'oversold'
+    else:
+        momentum = 'neutral'
+        
+    # Combine them into a complex state (e.g., "uptrend_overbought")
+    return f"{trend}_{momentum}"
 
-# --- Q-Learning Logic ---
+# --- Q-Learning Logic (Expanded Brain) ---
 
-# Initialize Q-table
-# State: uptrend, downtrend, neutral
-# Actions: 0 (Hold), 1 (Buy/Long), 2 (Sell/Short)
-q_table = {
-    'uptrend':   [0.0, 0.0, 0.0],
-    'downtrend': [0.0, 0.0, 0.0],
-    'neutral':   [0.0, 0.0, 0.0],
-    'unknown':   [0.0, 0.0, 0.0]
-}
+# We now generate states dynamically or define the common ones
+# 3 Trends * 3 Momentums = 9 States
+q_table = {} 
+
+def get_q_values(state):
+    # If state is new, initialize it with [0.0, 0.0, 0.0]
+    if state not in q_table:
+        q_table[state] = [0.0, 0.0, 0.0]
+    return q_table[state]
 
 def choose_action(state):
-    # Epsilon-greedy strategy
     if np.random.uniform(0, 1) < EPSILON:
         return np.random.choice([0, 1, 2]) # Explore
     else:
-        return np.argmax(q_table.get(state, [0,0,0])) # Exploit
+        return np.argmax(get_q_values(state)) # Exploit
 
 def update_q_table(state, action, reward, next_state):
-    """
-    Updates the Q-table using the Bellman equation.
-    """
     try:
-        current_q = q_table[state][action]
-        max_future_q = np.max(q_table[next_state])
+        current_q = get_q_values(state)[action]
+        max_future_q = np.max(get_q_values(next_state))
         
-        # Bellman Equation
         new_q = (1 - ALPHA) * current_q + ALPHA * (reward + GAMMA * max_future_q)
-        
         q_table[state][action] = new_q
-        logger.info(f"Updated Q-table for {state}, action {action}: {new_q:.4f}")
+        
+        # Only log significant updates to keep logs clean
+        if abs(new_q) > 0.001:
+            logger.info(f"Learned: {state} -> Action {action} = {new_q:.4f}")
+            
     except Exception as e:
-        logger.error(f"Error in update_q_table: {e}")
+        logger.error(f"Error updating Q-table: {e}")
 
-def calculate_reward(entry_price, current_price, position_type):
-    if position_type == 'long':
-        return (current_price - entry_price) / entry_price
-    elif position_type == 'short':
-        return (entry_price - current_price) / entry_price
+def calculate_reward(entry, current, pos_type):
+    if pos_type == 'long': return (current - entry) / entry
+    if pos_type == 'short': return (entry - current) / entry
     return 0
+
+# --- Save State for Shell Diagnostics ---
+def save_bot_state(stats):
+    try:
+        data = { 
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+            "stats": stats, 
+            "q_table": q_table # Dumps the whole brain
+        }
+        with open('bot_state.json', 'w') as f: 
+            json.dump(data, f, indent=4)
+    except Exception as e: 
+        logger.error(f"Save failed: {e}")
 
 # --- Execution Logic ---
 def execute_trade(exchange, symbol, action):
-    # This is a simplified execution for demonstration
-    # 0 = Hold, 1 = Buy, 2 = Sell
-    
-    # In a real bot, you would check current positions first using private API
-    # For now, we just log the intent
-    if action == 1:
-        logger.info(f"Signal: BUY {symbol}")
-        # exchange.create_market_buy_order(symbol, amount) <-- Real execution
-    elif action == 2:
-        logger.info(f"Signal: SELL {symbol}")
-        # exchange.create_market_sell_order(symbol, amount) <-- Real execution
-    else:
-        logger.info(f"Signal: HOLD {symbol}")
+    if action == 1: logger.info(f"Signal: BUY {symbol}")
+    elif action == 2: logger.info(f"Signal: SELL {symbol}")
+    else: logger.info(f"Signal: HOLD {symbol}")
 
 # --- Main Loop ---
 def main():
     exchange = connect_exchange()
-    if not exchange:
-        return
+    if not exchange: return
 
-    logger.info("Starting bot loop...")
-    
-    # Keep track of previous states to calculate rewards
-    previous_states = {symbol: 'unknown' for symbol in SYMBOLS}
-    previous_prices = {symbol: 0.0 for symbol in SYMBOLS}
-    last_actions = {symbol: 0 for symbol in SYMBOLS}
+    stats = {'wins': 0, 'losses': 0, 'total_actions': 0}
+    prev_states = {s: 'unknown' for s in SYMBOLS}
+    prev_prices = {s: 0.0 for s in SYMBOLS}
+    last_actions = {s: 0 for s in SYMBOLS}
+
+    logger.info("Bot upgraded with RSI Intelligence. Starting loop...")
 
     while True:
         try:
             for symbol in SYMBOLS:
-                df = fetch_data(exchange, symbol, TIMEFRAME)
-                if df.empty:
-                    continue
+                df = fetch_data(exchange, symbol)
+                if df.empty: continue
                 
-                current_state = get_state(df)
-                current_price = df.iloc[-1]['close']
+                curr_state = get_state(df)
+                curr_price = df.iloc[-1]['close']
                 
-                # 1. Calculate Reward from PREVIOUS action (if any)
-                # (Simplified: assumes we entered at previous price)
-                prev_state = previous_states[symbol]
-                prev_action = last_actions[symbol]
+                # Reward & Update
+                p_state, p_action = prev_states[symbol], last_actions[symbol]
                 
-                if prev_state != 'unknown':
+                if p_state != 'unknown':
                     reward = 0
-                    if prev_action == 1: # Long
-                        reward = calculate_reward(previous_prices[symbol], current_price, 'long')
-                    elif prev_action == 2: # Short
-                        reward = calculate_reward(previous_prices[symbol], current_price, 'short')
+                    if p_action == 1: reward = calculate_reward(prev_prices[symbol], curr_price, 'long')
+                    elif p_action == 2: reward = calculate_reward(prev_prices[symbol], curr_price, 'short')
                     
-                    # 2. Update Q-Table based on what happened
-                    update_q_table(prev_state, prev_action, reward, current_state)
+                    if reward > 0: stats['wins'] += 1
+                    elif reward < 0: stats['losses'] += 1
+                    if p_action != 0: stats['total_actions'] += 1
+                    
+                    update_q_table(p_state, p_action, reward, curr_state)
 
-                # 3. Decide NEW action
-                action = choose_action(current_state)
-                
-                # 4. Execute
+                # Action & Execute
+                action = choose_action(curr_state)
                 execute_trade(exchange, symbol, action)
                 
-                # 5. Store state for next iteration
-                previous_states[symbol] = current_state
-                previous_prices[symbol] = current_price
+                prev_states[symbol] = curr_state
+                prev_prices[symbol] = curr_price
                 last_actions[symbol] = action
-                
-            logger.info("Sleeping for 1 minute...")
-            time.sleep(60) # Run every minute
+            
+            # Save diagnostics
+            save_bot_state(stats)
+            time.sleep(60)
 
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user.")
-            break
+        except KeyboardInterrupt: break
         except Exception as e:
-            logger.error(f"Global Loop Error: {e}")
-            time.sleep(30) # Wait before retrying
+            logger.error(f"Loop Error: {e}")
+            time.sleep(30)
 
 if __name__ == "__main__":
     main()
