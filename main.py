@@ -9,6 +9,10 @@ from datetime import datetime
 # --- Configuration ---
 API_KEY = os.getenv('BYBIT_API_KEY')
 API_SECRET = os.getenv('BYBIT_API_SECRET')
+
+# SURGICAL FIX: Check Render Environment for TESTNET toggle
+USE_TESTNET = os.getenv('TESTNET', 'False').lower() == 'true'
+
 # Use 'linear' for USDT perpetuals on Bybit
 CATEGORY = 'linear' 
 SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'] 
@@ -40,6 +44,14 @@ def connect_exchange():
                 'adjustForTimeDifference': True,
             }
         })
+        
+        # SURGICAL FIX: Switch to Testnet only if configured
+        if USE_TESTNET:
+            exchange.set_sandbox_mode(True)
+            logger.info("⚠️ RUNNING IN TESTNET MODE ⚠️")
+        else:
+            logger.info("RUNNING IN LIVE MODE")
+
         # Check connection
         exchange.load_markets()
         logger.info("Connected to Bybit successfully.")
@@ -96,7 +108,6 @@ def choose_action(state):
     else:
         return np.argmax(q_table.get(state, [0,0,0])) # Exploit
 
-# THIS WAS MISSING PREVIOUSLY
 def update_q_table(state, action, reward, next_state):
     """
     Updates the Q-table using the Bellman equation.
