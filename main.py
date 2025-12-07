@@ -5,6 +5,7 @@ import time
 import os
 import logging
 import json
+import csv
 from datetime import datetime
 
 # --- Configuration ---
@@ -16,8 +17,7 @@ CATEGORY = 'linear'
 TIMEFRAME = '15m'
 LIMIT = 200 
 
-# --- EXPANDED ASSET LIST (The Top 30) ---
-# Selected for high liquidity and market cap.
+# --- EXPANDED ASSET LIST (Top 30) ---
 SYMBOLS = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 
     'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT', 'TRXUSDT', 'LINKUSDT',
@@ -32,11 +32,8 @@ ALPHA = 0.1
 GAMMA = 0.9  
 EPSILON = 0.1 
 
-# --- REALITY CHECK: FEES ---
-# Hurdle Rate: 0.15% (Fees + Slippage)
+# Fee Hurdle (0.15%)
 ROUND_TRIP_COST = 0.0015 
-
-# Risk Management
 RISK_PER_TRADE = 0.02 
 MAX_LEVERAGE = 5
 
@@ -76,7 +73,6 @@ def fetch_data(exchange, symbol):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception:
-        # Silent fail to keep logs clean for 30 coins
         return pd.DataFrame()
 
 # --- MATH INDICATORS ---
@@ -143,16 +139,44 @@ def update_q_table(state, action, reward, next_state):
         q_table[state][action] = new_q
     except Exception: pass
 
-# --- PROFIT-FOCUSED REWARD FUNCTION ---
-def calculate_reward(entry, current, pos_type):
+# --- PROFIT & LOGGING LOGIC ---
+def log_trade_to_csv(symbol, action_name, result_type, net_profit):
+    """
+    Saves a permanent record of every trade outcome.
+    """
+    file_exists = os.path.isfile('trades.csv')
+    try:
+        with open('trades.csv', 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(['Timestamp', 'Symbol', 'Action', 'Result', 'Net_Profit_Pct'])
+            
+            writer.writerow([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                symbol,
+                action_name,
+                result_type,
+                f"{net_profit*100:.4f}%"
+            ])
+    except Exception: pass
+
+def calculate_reward(entry, current, pos_type, symbol):
     raw_profit = 0
     if pos_type == 'long': 
         raw_profit = (current - entry) / entry
     elif pos_type == 'short': 
         raw_profit = (entry - current) / entry
     
-    # Net Profit must cover fees to be a win
+    # Net Profit (Fee Aware)
     net_reward = raw_profit - ROUND_TRIP_COST
+    
+    # Log Result
+    action_name = "LONG" if pos_type == 'long' else "SHORT"
+    result_type = "WIN" if net_reward > 0 else "LOSS"
+    
+    # Only log if it was a real trade attempt (not just holding)
+    log_trade_to_csv(symbol, action_name, result_type, net_reward)
+    
     return net_reward
 
 def save_bot_state(stats):
@@ -163,7 +187,7 @@ def save_bot_state(stats):
 
 # --- EXECUTION ---
 def execute_trade(exchange, symbol, action, atr, close_price):
-    if action == 0: return # Don't log Holds to reduce spam for 30 coins
+    if action == 0: return
 
     mock_balance = 1000 
     risk_amt = mock_balance * RISK_PER_TRADE
@@ -172,19 +196,21 @@ def execute_trade(exchange, symbol, action, atr, close_price):
     position_size = min(position_size, mock_balance / close_price * MAX_LEVERAGE)
 
     side = "BUY" if action == 1 else "SELL"
-    logger.info(f"Signal: {side} {symbol} | Size: {position_size:.4f} | Must beat 0.15%")
+    logger.info(f"Signal: {side} {symbol} | Size: {position_size:.4f}")
 
 # --- Main Loop ---
 def main():
     exchange = connect_exchange()
     if not exchange: return
 
-    stats = {'wins': 0, 'losses': 0, 'total_actions': 0}
+    # Stats now include Cumulative PnL
+    stats = {'wins': 0, 'losses': 0, 'total_actions': 0, 'cumulative_pnl_percent': 0.0}
+    
     prev_states = {s: 'unknown' for s in SYMBOLS}
     prev_prices = {s: 0.0 for s in SYMBOLS}
     last_actions = {s: 0 for s in SYMBOLS}
 
-    logger.info(f"Bot Active on {len(SYMBOLS)} Pairs. Standard Plan Performance Mode.")
+    logger.info(f"Bot Active on {len(SYMBOLS)} Pairs. Black Box Recorder Enabled.")
 
     while True:
         try:
@@ -200,12 +226,16 @@ def main():
                 p_state, p_action = prev_states[symbol], last_actions[symbol]
                 if p_state != 'unknown':
                     reward = 0
-                    if p_action == 1: reward = calculate_reward(prev_prices[symbol], curr_price, 'long')
-                    elif p_action == 2: reward = calculate_reward(prev_prices[symbol], curr_price, 'short')
+                    if p_action == 1: 
+                        reward = calculate_reward(prev_prices[symbol], curr_price, 'long', symbol)
+                    elif p_action == 2: 
+                        reward = calculate_reward(prev_prices[symbol], curr_price, 'short', symbol)
                     
-                    if reward > 0: stats['wins'] += 1
-                    elif reward < 0: stats['losses'] += 1
-                    if p_action != 0: stats['total_actions'] += 1
+                    if p_action != 0:
+                        stats['total_actions'] += 1
+                        stats['cumulative_pnl_percent'] += reward
+                        if reward > 0: stats['wins'] += 1
+                        elif reward < 0: stats['losses'] += 1
                     
                     update_q_table(p_state, p_action, reward, curr_state)
 
@@ -217,11 +247,9 @@ def main():
                 prev_prices[symbol] = curr_price
                 last_actions[symbol] = action
                 
-                # RATE LIMIT PROTECTION: Tiny pause between coins
                 time.sleep(0.2) 
             
             save_bot_state(stats)
-            # Sleep less because the loop itself takes ~6-10 seconds now
             time.sleep(50) 
 
         except KeyboardInterrupt: break
