@@ -13,24 +13,31 @@ API_SECRET = os.getenv('BYBIT_API_SECRET')
 USE_TESTNET = os.getenv('TESTNET', 'False').lower() == 'true'
 
 CATEGORY = 'linear' 
-SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'] 
 TIMEFRAME = '15m'
 LIMIT = 200 
+
+# --- EXPANDED ASSET LIST (The Top 30) ---
+# Selected for high liquidity and market cap.
+SYMBOLS = [
+    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 
+    'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT', 'TRXUSDT', 'LINKUSDT',
+    'DOTUSDT', 'MATICUSDT', 'LTCUSDT', 'BCHUSDT', 'UNIUSDT',
+    'NEARUSDT', 'APTUSDT', 'FILUSDT', 'ATOMUSDT', 'ARBUSDT',
+    'OPUSDT', 'ETCUSDT', 'ICPUSDT', 'IMXUSDT', 'RNDRUSDT',
+    'SHIBUSDT', 'SUIUSDT', 'XLMUSDT', 'HBARUSDT', 'INJUSDT'
+]
 
 # Q-Learning Parameters
 ALPHA = 0.1  
 GAMMA = 0.9  
 EPSILON = 0.1 
 
-# --- CRITICAL: REALITY CHECK ---
-# We simulate a "Hurdle Rate".
-# Bybit Fee (0.06%) * 2 (Entry/Exit) = 0.12%
-# We set this to 0.0015 (0.15%) to account for slippage.
-# The bot will ONLY be happy if it makes more than 0.15% profit.
+# --- REALITY CHECK: FEES ---
+# Hurdle Rate: 0.15% (Fees + Slippage)
 ROUND_TRIP_COST = 0.0015 
 
 # Risk Management
-RISK_PER_TRADE = 0.02 # Increased slightly to 2% since we trade less often
+RISK_PER_TRADE = 0.02 
 MAX_LEVERAGE = 5
 
 # --- Logging Setup ---
@@ -69,6 +76,7 @@ def fetch_data(exchange, symbol):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception:
+        # Silent fail to keep logs clean for 30 coins
         return pd.DataFrame()
 
 # --- MATH INDICATORS ---
@@ -137,18 +145,14 @@ def update_q_table(state, action, reward, next_state):
 
 # --- PROFIT-FOCUSED REWARD FUNCTION ---
 def calculate_reward(entry, current, pos_type):
-    # 1. Calculate Raw Gain
     raw_profit = 0
     if pos_type == 'long': 
         raw_profit = (current - entry) / entry
     elif pos_type == 'short': 
         raw_profit = (entry - current) / entry
     
-    # 2. SUBTRACT "THE HOUSE CUT"
-    # If the trade made 0.10%, but fees are 0.15%, the Result is -0.05% (NEGATIVE).
-    # The bot learns that small trades are painful.
+    # Net Profit must cover fees to be a win
     net_reward = raw_profit - ROUND_TRIP_COST
-    
     return net_reward
 
 def save_bot_state(stats):
@@ -159,11 +163,8 @@ def save_bot_state(stats):
 
 # --- EXECUTION ---
 def execute_trade(exchange, symbol, action, atr, close_price):
-    if action == 0:
-        logger.info(f"Signal: HOLD {symbol}")
-        return
+    if action == 0: return # Don't log Holds to reduce spam for 30 coins
 
-    # Dynamic Sizing (Risk Management)
     mock_balance = 1000 
     risk_amt = mock_balance * RISK_PER_TRADE
     if pd.isna(atr) or atr == 0: atr = close_price * 0.01 
@@ -171,8 +172,7 @@ def execute_trade(exchange, symbol, action, atr, close_price):
     position_size = min(position_size, mock_balance / close_price * MAX_LEVERAGE)
 
     side = "BUY" if action == 1 else "SELL"
-    # Log the fee awareness
-    logger.info(f"Signal: {side} {symbol} | Size: {position_size:.4f} | Must beat 0.15% to win")
+    logger.info(f"Signal: {side} {symbol} | Size: {position_size:.4f} | Must beat 0.15%")
 
 # --- Main Loop ---
 def main():
@@ -184,7 +184,7 @@ def main():
     prev_prices = {s: 0.0 for s in SYMBOLS}
     last_actions = {s: 0 for s in SYMBOLS}
 
-    logger.info("Bot Updated: Strict Fee Filtering Enabled.")
+    logger.info(f"Bot Active on {len(SYMBOLS)} Pairs. Standard Plan Performance Mode.")
 
     while True:
         try:
@@ -203,7 +203,6 @@ def main():
                     if p_action == 1: reward = calculate_reward(prev_prices[symbol], curr_price, 'long')
                     elif p_action == 2: reward = calculate_reward(prev_prices[symbol], curr_price, 'short')
                     
-                    # Update Stats (Only count as win if reward is POSITIVE after fees)
                     if reward > 0: stats['wins'] += 1
                     elif reward < 0: stats['losses'] += 1
                     if p_action != 0: stats['total_actions'] += 1
@@ -217,9 +216,13 @@ def main():
                 prev_states[symbol] = curr_state
                 prev_prices[symbol] = curr_price
                 last_actions[symbol] = action
+                
+                # RATE LIMIT PROTECTION: Tiny pause between coins
+                time.sleep(0.2) 
             
             save_bot_state(stats)
-            time.sleep(60)
+            # Sleep less because the loop itself takes ~6-10 seconds now
+            time.sleep(50) 
 
         except KeyboardInterrupt: break
         except Exception as e:
