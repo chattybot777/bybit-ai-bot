@@ -22,8 +22,15 @@ ALPHA = 0.1
 GAMMA = 0.9  
 EPSILON = 0.1 
 
+# --- CRITICAL: REALITY CHECK ---
+# We simulate a "Hurdle Rate".
+# Bybit Fee (0.06%) * 2 (Entry/Exit) = 0.12%
+# We set this to 0.0015 (0.15%) to account for slippage.
+# The bot will ONLY be happy if it makes more than 0.15% profit.
+ROUND_TRIP_COST = 0.0015 
+
 # Risk Management
-RISK_PER_TRADE = 0.01 # Risk 1% of capital per trade
+RISK_PER_TRADE = 0.02 # Increased slightly to 2% since we trade less often
 MAX_LEVERAGE = 5
 
 # --- Logging Setup ---
@@ -64,8 +71,7 @@ def fetch_data(exchange, symbol):
     except Exception:
         return pd.DataFrame()
 
-# --- MATH UPGRADES (Lean & Fast) ---
-
+# --- MATH INDICATORS ---
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
@@ -74,7 +80,6 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def calculate_atr(df, period=14):
-    # Volatility Measure
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
@@ -83,7 +88,6 @@ def calculate_atr(df, period=14):
     return true_range.rolling(period).mean()
 
 def calculate_obv(df):
-    # Volume Confirmation
     obv = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
     return obv
 
@@ -91,40 +95,25 @@ def calculate_obv(df):
 def get_state(df):
     if df.empty or len(df) < 50: return 'unknown'
     
-    # 1. Trend (SMA)
     df['SMA_12'] = df['close'].rolling(12).mean()
     df['SMA_26'] = df['close'].rolling(26).mean()
-    
-    # 2. Momentum (RSI)
     df['RSI'] = calculate_rsi(df['close'])
-    
-    # 3. Volatility (ATR)
     df['ATR'] = calculate_atr(df)
-    
-    # 4. Volume (OBV Slope)
     df['OBV'] = calculate_obv(df)
-    df['OBV_SMA'] = df['OBV'].rolling(12).mean() # Is volume trending up?
+    df['OBV_SMA'] = df['OBV'].rolling(12).mean()
 
     latest = df.iloc[-1]
     
-    # Trend
     trend = 'uptrend' if latest['SMA_12'] > latest['SMA_26'] else 'downtrend'
-    if abs(latest['SMA_12'] - latest['SMA_26']) < (latest['close'] * 0.001): trend = 'neutral' # Filter weak trends
+    if abs(latest['SMA_12'] - latest['SMA_26']) < (latest['close'] * 0.001): trend = 'neutral'
 
-    # RSI
     momentum = 'neutral'
     if latest['RSI'] > 70: momentum = 'overbought'
     elif latest['RSI'] < 30: momentum = 'oversold'
     
-    # Volatility State (Low/High)
-    # Compare current ATR to average ATR of last 50 candles
     avg_atr = df['ATR'].rolling(50).mean().iloc[-1]
     volatility = 'high_vol' if latest['ATR'] > avg_atr else 'low_vol'
     
-    # Volume Confirmation
-    volume_conf = 'conf' if latest['OBV'] > latest['OBV_SMA'] else 'div' # Confirmed or Divergent
-
-    # Complex State: "uptrend_overbought_highvol_conf"
     return f"{trend}_{momentum}_{volatility}"
 
 # --- Q-Learning Logic ---
@@ -146,10 +135,21 @@ def update_q_table(state, action, reward, next_state):
         q_table[state][action] = new_q
     except Exception: pass
 
+# --- PROFIT-FOCUSED REWARD FUNCTION ---
 def calculate_reward(entry, current, pos_type):
-    if pos_type == 'long': return (current - entry) / entry
-    if pos_type == 'short': return (entry - current) / entry
-    return 0
+    # 1. Calculate Raw Gain
+    raw_profit = 0
+    if pos_type == 'long': 
+        raw_profit = (current - entry) / entry
+    elif pos_type == 'short': 
+        raw_profit = (entry - current) / entry
+    
+    # 2. SUBTRACT "THE HOUSE CUT"
+    # If the trade made 0.10%, but fees are 0.15%, the Result is -0.05% (NEGATIVE).
+    # The bot learns that small trades are painful.
+    net_reward = raw_profit - ROUND_TRIP_COST
+    
+    return net_reward
 
 def save_bot_state(stats):
     try:
@@ -157,28 +157,22 @@ def save_bot_state(stats):
         with open('bot_state.json', 'w') as f: json.dump(data, f, indent=4)
     except Exception: pass
 
-# --- EXECUTION (With Dynamic Sizing) ---
+# --- EXECUTION ---
 def execute_trade(exchange, symbol, action, atr, close_price):
     if action == 0:
         logger.info(f"Signal: HOLD {symbol}")
         return
 
-    # Dynamic Position Sizing based on Volatility (ATR)
-    # If Volatility is HIGH, Position Size is LOW
-    # Formula: (Account Balance * Risk) / ATR
-    # *Simplified for demo: We just calculate the raw quantity, assuming $1000 balance
-    
+    # Dynamic Sizing (Risk Management)
     mock_balance = 1000 
     risk_amt = mock_balance * RISK_PER_TRADE
-    
-    # Safety check for zero/nan ATR
     if pd.isna(atr) or atr == 0: atr = close_price * 0.01 
-    
     position_size = risk_amt / atr
-    position_size = min(position_size, mock_balance / close_price * MAX_LEVERAGE) # Cap leverage
+    position_size = min(position_size, mock_balance / close_price * MAX_LEVERAGE)
 
     side = "BUY" if action == 1 else "SELL"
-    logger.info(f"Signal: {side} {symbol} | Size: {position_size:.4f} (Adj. for Volatility)")
+    # Log the fee awareness
+    logger.info(f"Signal: {side} {symbol} | Size: {position_size:.4f} | Must beat 0.15% to win")
 
 # --- Main Loop ---
 def main():
@@ -190,7 +184,7 @@ def main():
     prev_prices = {s: 0.0 for s in SYMBOLS}
     last_actions = {s: 0 for s in SYMBOLS}
 
-    logger.info("Bot upgraded to Ultimate Edition (ATR + OBV + Risk Mgr).")
+    logger.info("Bot Updated: Strict Fee Filtering Enabled.")
 
     while True:
         try:
@@ -209,6 +203,7 @@ def main():
                     if p_action == 1: reward = calculate_reward(prev_prices[symbol], curr_price, 'long')
                     elif p_action == 2: reward = calculate_reward(prev_prices[symbol], curr_price, 'short')
                     
+                    # Update Stats (Only count as win if reward is POSITIVE after fees)
                     if reward > 0: stats['wins'] += 1
                     elif reward < 0: stats['losses'] += 1
                     if p_action != 0: stats['total_actions'] += 1
