@@ -19,13 +19,13 @@ CATEGORY = 'linear'
 TIMEFRAME = '15m'
 LIMIT = 200 
 
+# --- CONCENTRATED ASSET LIST (Top 5) ---
 SYMBOLS = [
-    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 
-    'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT', 'TRXUSDT', 'LINKUSDT',
-    'DOTUSDT', 'MATICUSDT', 'LTCUSDT', 'BCHUSDT', 'UNIUSDT',
-    'NEARUSDT', 'APTUSDT', 'FILUSDT', 'ATOMUSDT', 'ARBUSDT',
-    'OPUSDT', 'ETCUSDT', 'ICPUSDT', 'IMXUSDT', 'RNDRUSDT',
-    'SHIBUSDT', 'SUIUSDT', 'XLMUSDT', 'HBARUSDT', 'INJUSDT'
+    'BTCUSDT', 
+    'ETHUSDT', 
+    'SOLUSDT', 
+    'XRPUSDT', 
+    'DOGEUSDT'
 ]
 
 # Q-Learning Constants
@@ -35,7 +35,7 @@ EPSILON = 0.1
 ROUND_TRIP_COST = 0.0015 
 MAX_LEVERAGE = 5
 
-# --- Shared Memory (The Brain & Controls) ---
+# --- Shared Memory ---
 bot_memory = {
     'wins': 0, 
     'losses': 0, 
@@ -47,10 +47,9 @@ bot_memory = {
     'uptime': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 }
 
-# Live Log Buffer (Stores last 50 lines for the web)
 log_buffer = deque(maxlen=50)
 
-# --- Custom Logger to feed the Website ---
+# --- Logging ---
 class WebLogger(logging.Handler):
     def emit(self, record):
         log_entry = self.format(record)
@@ -61,7 +60,7 @@ logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger()
 logger.addHandler(WebLogger()) 
 
-# --- WEB DASHBOARD (Flask) ---
+# --- WEB DASHBOARD ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -73,7 +72,7 @@ def dashboard():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Gavin's AI Trader</title>
+        <title>Gavin's AI Trader (Top 5)</title>
         <meta http-equiv="refresh" content="10">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
@@ -96,7 +95,7 @@ def dashboard():
         <div class="container">
             <div class="card">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
-                    <h2>🤖 Mission Control</h2>
+                    <h2>🤖 Top 5 Sniper</h2>
                     <span style="background:{state_color}; color:white; padding:5px 15px; border-radius:20px; font-weight:bold; font-size:12px;">
                         {bot_memory['status']}
                     </span>
@@ -112,7 +111,7 @@ def dashboard():
             </div>
 
             <div class="card">
-                <h3>⚙️ Send Instructions</h3>
+                <h3>⚙️ Controls</h3>
                 <form action="/control" method="post" style="margin-bottom:15px;">
                     <button name="action" value="start" class="btn-start">▶ Resume</button>
                     <button name="action" value="stop" class="btn-stop">⏸ Pause</button>
@@ -142,10 +141,10 @@ def control():
     action = request.form.get('action')
     if action == 'stop':
         bot_memory['status'] = "PAUSED"
-        logger.warning("⏸ INSTRUCTION RECEIVED: PAUSE BOT")
+        logger.warning("⏸ BOT PAUSED")
     elif action == 'start':
         bot_memory['status'] = "RUNNING"
-        logger.info("▶ INSTRUCTION RECEIVED: RESUME BOT")
+        logger.info("▶ BOT RESUMED")
     return redirect(url_for('dashboard'))
 
 @app.route('/settings', methods=['POST'])
@@ -153,7 +152,7 @@ def settings():
     try:
         new_risk = float(request.form.get('risk'))
         bot_memory['risk_per_trade'] = new_risk
-        logger.info(f"⚙️ INSTRUCTION RECEIVED: Set Risk to {new_risk*100}%")
+        logger.info(f"⚙️ Risk set to {new_risk*100}%")
     except: pass
     return redirect(url_for('dashboard'))
 
@@ -177,7 +176,6 @@ def fetch_data(exchange, symbol):
         return df
     except: return pd.DataFrame()
 
-# Math & Logic
 def calculate_indicators(df):
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
@@ -213,7 +211,6 @@ def get_state(df):
     
     return f"{trend}_{momentum}_{volatility}"
 
-# Q-Learning
 q_table = {} 
 def get_q_values(state):
     if state not in q_table: q_table[state] = [0.0, 0.0, 0.0]
@@ -249,13 +246,10 @@ def execute_trade(exchange, symbol, action, atr, close_price, state):
     
     balance = 1000 
     risk = balance * bot_memory['risk_per_trade']
-    
     if pd.isna(atr) or atr == 0: atr = close_price * 0.01 
     size = min(risk / atr, balance / close_price * MAX_LEVERAGE)
     
     side = "BUY" if action == 1 else "SELL"
-    
-    # ENHANCED LOGGING: Shows the "Why"
     logger.info(f"⚡ {side} {symbol} | State: {state} | Size: {size:.4f}")
 
 def save_bot_state():
@@ -277,7 +271,7 @@ def main():
     prev_prices = {s: 0.0 for s in SYMBOLS}
     last_actions = {s: 0 for s in SYMBOLS}
 
-    logger.info("🚀 Mission Control Online. Waiting for market opportunities...")
+    logger.info(f"🚀 Top 5 Sniper Mode Active. Monitoring: {SYMBOLS}")
 
     while True:
         try:
@@ -308,7 +302,6 @@ def main():
                     update_q_table(p_state, p_action, reward, curr_state)
 
                 action = choose_action(curr_state)
-                # Pass the State to the executor for better logging
                 execute_trade(exchange, symbol, action, curr_atr, curr_price, curr_state)
                 if action != 0: trades_made += 1
                 
@@ -316,9 +309,8 @@ def main():
                 prev_prices[symbol] = curr_price
                 last_actions[symbol] = action
                 
-                time.sleep(0.2) 
+                time.sleep(0.5) # Increased sleep for safety with fewer coins
             
-            # Heartbeat Log if no trades happened
             if trades_made == 0:
                 logger.info(f"💤 Scan Complete. Market calm. {len(SYMBOLS)} pairs checked.")
             
