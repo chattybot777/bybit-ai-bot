@@ -67,7 +67,7 @@ app = Flask(__name__)
 @app.route('/')
 def dashboard():
     state_color = "green" if bot_memory['status'] == "RUNNING" else "red"
-    logs_html = "".join([f"<div style='border-bottom:1px solid #eee; padding:5px; font-family:monospace;'>{log}</div>" for log in log_buffer])
+    logs_html = "".join([f"<div style='border-bottom:1px solid #eee; padding:5px; font-family:monospace; font-size:12px;'>{log}</div>" for log in log_buffer])
     
     html = f"""
     <!DOCTYPE html>
@@ -77,15 +77,15 @@ def dashboard():
         <meta http-equiv="refresh" content="10">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
-            body {{ font-family: -apple-system, system-ui, sans-serif; background: #f0f2f5; padding: 20px; }}
+            body {{ font-family: -apple-system, system-ui, sans-serif; background: #f0f2f5; padding: 20px; margin: 0; }}
             .container {{ max-width: 800px; margin: auto; }}
             .card {{ background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }}
-            .stat-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; }}
-            .stat-box {{ background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; }}
-            .value {{ font-size: 24px; font-weight: bold; color: #333; }}
-            .label {{ color: #666; font-size: 14px; }}
+            .stat-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }}
+            .stat-box {{ background: #f8f9fa; padding: 10px; border-radius: 8px; text-align: center; }}
+            .value {{ font-size: 20px; font-weight: bold; color: #333; }}
+            .label {{ color: #666; font-size: 12px; }}
             .log-box {{ height: 300px; overflow-y: auto; background: #fff; border: 1px solid #ddd; padding: 10px; border-radius: 8px; }}
-            button {{ padding: 10px 20px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; margin-right: 10px; }}
+            button {{ padding: 10px 20px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; margin-right: 5px; }}
             .btn-stop {{ background: #ff4757; color: white; }}
             .btn-start {{ background: #2ed573; color: white; }}
             .btn-update {{ background: #3742fa; color: white; }}
@@ -96,8 +96,8 @@ def dashboard():
         <div class="container">
             <div class="card">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
-                    <h1>🤖 Mission Control</h1>
-                    <span style="background:{state_color}; color:white; padding:5px 15px; border-radius:20px; font-weight:bold;">
+                    <h2>🤖 Mission Control</h2>
+                    <span style="background:{state_color}; color:white; padding:5px 15px; border-radius:20px; font-weight:bold; font-size:12px;">
                         {bot_memory['status']}
                     </span>
                 </div>
@@ -108,25 +108,25 @@ def dashboard():
                     <div class="stat-box"><div class="value">{bot_memory['total_actions']}</div><div class="label">Total Trades</div></div>
                     <div class="stat-box"><div class="value">{bot_memory['cumulative_pnl_percent']*100:.2f}%</div><div class="label">Net PnL</div></div>
                 </div>
-                <p><strong>Last Action:</strong> {bot_memory['last_trade']}</p>
+                <p style="font-size:14px;"><strong>Last Action:</strong> {bot_memory['last_trade']}</p>
             </div>
 
             <div class="card">
-                <h3>⚙️ Controls</h3>
-                <form action="/control" method="post" style="margin-bottom:20px;">
+                <h3>⚙️ Send Instructions</h3>
+                <form action="/control" method="post" style="margin-bottom:15px;">
                     <button name="action" value="start" class="btn-start">▶ Resume</button>
                     <button name="action" value="stop" class="btn-stop">⏸ Pause</button>
                 </form>
                 
                 <form action="/settings" method="post">
-                    <label>Risk Per Trade (%): </label>
+                    <label style="font-size:14px;">Set Risk %: </label>
                     <input type="number" step="0.01" name="risk" value="{bot_memory['risk_per_trade']}">
-                    <button type="submit" class="btn-update">Update Risk</button>
+                    <button type="submit" class="btn-update">Update</button>
                 </form>
             </div>
 
             <div class="card">
-                <h3>🧠 Bot Thoughts (Live Feed)</h3>
+                <h3>🧠 Bot Thought Stream</h3>
                 <div class="log-box">
                     {logs_html}
                 </div>
@@ -142,10 +142,10 @@ def control():
     action = request.form.get('action')
     if action == 'stop':
         bot_memory['status'] = "PAUSED"
-        logger.warning("⏸ BOT PAUSED BY USER")
+        logger.warning("⏸ INSTRUCTION RECEIVED: PAUSE BOT")
     elif action == 'start':
         bot_memory['status'] = "RUNNING"
-        logger.info("▶ BOT RESUMED BY USER")
+        logger.info("▶ INSTRUCTION RECEIVED: RESUME BOT")
     return redirect(url_for('dashboard'))
 
 @app.route('/settings', methods=['POST'])
@@ -153,7 +153,7 @@ def settings():
     try:
         new_risk = float(request.form.get('risk'))
         bot_memory['risk_per_trade'] = new_risk
-        logger.info(f"⚙️ Risk adjusted to {new_risk*100}% by user")
+        logger.info(f"⚙️ INSTRUCTION RECEIVED: Set Risk to {new_risk*100}%")
     except: pass
     return redirect(url_for('dashboard'))
 
@@ -244,7 +244,7 @@ def calculate_reward(entry, current, pos_type, symbol):
     
     return net
 
-def execute_trade(exchange, symbol, action, atr, close_price):
+def execute_trade(exchange, symbol, action, atr, close_price, state):
     if action == 0: return
     
     balance = 1000 
@@ -254,7 +254,9 @@ def execute_trade(exchange, symbol, action, atr, close_price):
     size = min(risk / atr, balance / close_price * MAX_LEVERAGE)
     
     side = "BUY" if action == 1 else "SELL"
-    logger.info(f"Signal: {side} {symbol} | Size: {size:.4f} | Risk: {bot_memory['risk_per_trade']*100}%")
+    
+    # ENHANCED LOGGING: Shows the "Why"
+    logger.info(f"⚡ {side} {symbol} | State: {state} | Size: {size:.4f}")
 
 def save_bot_state():
     try:
@@ -275,7 +277,7 @@ def main():
     prev_prices = {s: 0.0 for s in SYMBOLS}
     last_actions = {s: 0 for s in SYMBOLS}
 
-    logger.info("🚀 System Online. Access Dashboard to monitor.")
+    logger.info("🚀 Mission Control Online. Waiting for market opportunities...")
 
     while True:
         try:
@@ -283,6 +285,7 @@ def main():
                 time.sleep(5) 
                 continue
 
+            trades_made = 0
             for symbol in SYMBOLS:
                 df = fetch_data(exchange, symbol)
                 if df.empty: continue
@@ -305,13 +308,19 @@ def main():
                     update_q_table(p_state, p_action, reward, curr_state)
 
                 action = choose_action(curr_state)
-                execute_trade(exchange, symbol, action, curr_atr, curr_price)
+                # Pass the State to the executor for better logging
+                execute_trade(exchange, symbol, action, curr_atr, curr_price, curr_state)
+                if action != 0: trades_made += 1
                 
                 prev_states[symbol] = curr_state
                 prev_prices[symbol] = curr_price
                 last_actions[symbol] = action
                 
                 time.sleep(0.2) 
+            
+            # Heartbeat Log if no trades happened
+            if trades_made == 0:
+                logger.info(f"💤 Scan Complete. Market calm. {len(SYMBOLS)} pairs checked.")
             
             save_bot_state()
             time.sleep(50) 
