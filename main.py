@@ -6,18 +6,19 @@ import os
 import logging
 import json
 import csv
+import threading
 from datetime import datetime
+from collections import deque
+from flask import Flask, request, redirect, url_for
 
 # --- Configuration ---
 API_KEY = os.getenv('BYBIT_API_KEY')
 API_SECRET = os.getenv('BYBIT_API_SECRET')
 USE_TESTNET = os.getenv('TESTNET', 'False').lower() == 'true'
-
 CATEGORY = 'linear' 
 TIMEFRAME = '15m'
 LIMIT = 200 
 
-# --- EXPANDED ASSET LIST (Top 30) ---
 SYMBOLS = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 
     'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT', 'TRXUSDT', 'LINKUSDT',
@@ -27,90 +28,182 @@ SYMBOLS = [
     'SHIBUSDT', 'SUIUSDT', 'XLMUSDT', 'HBARUSDT', 'INJUSDT'
 ]
 
-# Q-Learning Parameters
+# Q-Learning Constants
 ALPHA = 0.1  
 GAMMA = 0.9  
 EPSILON = 0.1 
-
-# Fee Hurdle (0.15%)
 ROUND_TRIP_COST = 0.0015 
-RISK_PER_TRADE = 0.02 
 MAX_LEVERAGE = 5
 
-# --- Logging Setup ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()] 
-)
-logger = logging.getLogger()
+# --- Shared Memory (The Brain & Controls) ---
+bot_memory = {
+    'wins': 0, 
+    'losses': 0, 
+    'total_actions': 0, 
+    'cumulative_pnl_percent': 0.0,
+    'last_trade': "None yet",
+    'status': "RUNNING", 
+    'risk_per_trade': 0.02, 
+    'uptime': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+}
 
-# --- Exchange Connection ---
+# Live Log Buffer (Stores last 50 lines for the web)
+log_buffer = deque(maxlen=50)
+
+# --- Custom Logger to feed the Website ---
+class WebLogger(logging.Handler):
+    def emit(self, record):
+        log_entry = self.format(record)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_buffer.appendleft(f"[{timestamp}] {log_entry}")
+
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger()
+logger.addHandler(WebLogger()) 
+
+# --- WEB DASHBOARD (Flask) ---
+app = Flask(__name__)
+
+@app.route('/')
+def dashboard():
+    state_color = "green" if bot_memory['status'] == "RUNNING" else "red"
+    logs_html = "".join([f"<div style='border-bottom:1px solid #eee; padding:5px; font-family:monospace;'>{log}</div>" for log in log_buffer])
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Gavin's AI Trader</title>
+        <meta http-equiv="refresh" content="10">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body {{ font-family: -apple-system, system-ui, sans-serif; background: #f0f2f5; padding: 20px; }}
+            .container {{ max-width: 800px; margin: auto; }}
+            .card {{ background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }}
+            .stat-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; }}
+            .stat-box {{ background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; }}
+            .value {{ font-size: 24px; font-weight: bold; color: #333; }}
+            .label {{ color: #666; font-size: 14px; }}
+            .log-box {{ height: 300px; overflow-y: auto; background: #fff; border: 1px solid #ddd; padding: 10px; border-radius: 8px; }}
+            button {{ padding: 10px 20px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; margin-right: 10px; }}
+            .btn-stop {{ background: #ff4757; color: white; }}
+            .btn-start {{ background: #2ed573; color: white; }}
+            .btn-update {{ background: #3742fa; color: white; }}
+            input {{ padding: 8px; border-radius: 4px; border: 1px solid #ccc; width: 80px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="card">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h1>🤖 Mission Control</h1>
+                    <span style="background:{state_color}; color:white; padding:5px 15px; border-radius:20px; font-weight:bold;">
+                        {bot_memory['status']}
+                    </span>
+                </div>
+                
+                <div class="stat-grid">
+                    <div class="stat-box"><div class="value" style="color:green">{bot_memory['wins']}</div><div class="label">Wins</div></div>
+                    <div class="stat-box"><div class="value" style="color:red">{bot_memory['losses']}</div><div class="label">Losses</div></div>
+                    <div class="stat-box"><div class="value">{bot_memory['total_actions']}</div><div class="label">Total Trades</div></div>
+                    <div class="stat-box"><div class="value">{bot_memory['cumulative_pnl_percent']*100:.2f}%</div><div class="label">Net PnL</div></div>
+                </div>
+                <p><strong>Last Action:</strong> {bot_memory['last_trade']}</p>
+            </div>
+
+            <div class="card">
+                <h3>⚙️ Controls</h3>
+                <form action="/control" method="post" style="margin-bottom:20px;">
+                    <button name="action" value="start" class="btn-start">▶ Resume</button>
+                    <button name="action" value="stop" class="btn-stop">⏸ Pause</button>
+                </form>
+                
+                <form action="/settings" method="post">
+                    <label>Risk Per Trade (%): </label>
+                    <input type="number" step="0.01" name="risk" value="{bot_memory['risk_per_trade']}">
+                    <button type="submit" class="btn-update">Update Risk</button>
+                </form>
+            </div>
+
+            <div class="card">
+                <h3>🧠 Bot Thoughts (Live Feed)</h3>
+                <div class="log-box">
+                    {logs_html}
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
+
+@app.route('/control', methods=['POST'])
+def control():
+    action = request.form.get('action')
+    if action == 'stop':
+        bot_memory['status'] = "PAUSED"
+        logger.warning("⏸ BOT PAUSED BY USER")
+    elif action == 'start':
+        bot_memory['status'] = "RUNNING"
+        logger.info("▶ BOT RESUMED BY USER")
+    return redirect(url_for('dashboard'))
+
+@app.route('/settings', methods=['POST'])
+def settings():
+    try:
+        new_risk = float(request.form.get('risk'))
+        bot_memory['risk_per_trade'] = new_risk
+        logger.info(f"⚙️ Risk adjusted to {new_risk*100}% by user")
+    except: pass
+    return redirect(url_for('dashboard'))
+
+def run_web_server():
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# --- TRADING LOGIC ---
 def connect_exchange():
     try:
-        exchange = ccxt.bybit({
-            'apiKey': API_KEY,
-            'secret': API_SECRET,
-            'enableRateLimit': True,
-            'options': { 'defaultType': 'future', 'adjustForTimeDifference': True }
-        })
-        if USE_TESTNET:
-            exchange.set_sandbox_mode(True)
-            logger.info("⚠️ RUNNING IN TESTNET MODE ⚠️")
-        else:
-            logger.info("RUNNING IN LIVE MODE")
-        exchange.load_markets()
+        exchange = ccxt.bybit({'apiKey': API_KEY, 'secret': API_SECRET})
+        if USE_TESTNET: exchange.set_sandbox_mode(True)
         return exchange
-    except Exception as e:
-        logger.error(f"Failed to connect: {e}")
-        return None
+    except: return None
 
-# --- Data Fetching ---
 def fetch_data(exchange, symbol):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=LIMIT)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
-    except Exception:
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
-# --- MATH INDICATORS ---
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+# Math & Logic
+def calculate_indicators(df):
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def calculate_atr(df, period=14):
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = ranges.max(axis=1)
-    return true_range.rolling(period).mean()
+    df['ATR'] = ranges.max(axis=1).rolling(14).mean()
+    
+    df['OBV'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
+    return df
 
-def calculate_obv(df):
-    obv = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
-    return obv
-
-# --- ADVANCED STATE ---
 def get_state(df):
     if df.empty or len(df) < 50: return 'unknown'
-    
+    df = calculate_indicators(df)
     df['SMA_12'] = df['close'].rolling(12).mean()
     df['SMA_26'] = df['close'].rolling(26).mean()
-    df['RSI'] = calculate_rsi(df['close'])
-    df['ATR'] = calculate_atr(df)
-    df['OBV'] = calculate_obv(df)
-    df['OBV_SMA'] = df['OBV'].rolling(12).mean()
-
     latest = df.iloc[-1]
     
     trend = 'uptrend' if latest['SMA_12'] > latest['SMA_26'] else 'downtrend'
     if abs(latest['SMA_12'] - latest['SMA_26']) < (latest['close'] * 0.001): trend = 'neutral'
-
+    
     momentum = 'neutral'
     if latest['RSI'] > 70: momentum = 'overbought'
     elif latest['RSI'] < 30: momentum = 'oversold'
@@ -120,9 +213,8 @@ def get_state(df):
     
     return f"{trend}_{momentum}_{volatility}"
 
-# --- Q-Learning Logic ---
+# Q-Learning
 q_table = {} 
-
 def get_q_values(state):
     if state not in q_table: q_table[state] = [0.0, 0.0, 0.0]
     return q_table[state]
@@ -133,87 +225,64 @@ def choose_action(state):
 
 def update_q_table(state, action, reward, next_state):
     try:
-        current_q = get_q_values(state)[action]
-        max_next_q = np.max(get_q_values(next_state))
-        new_q = (1 - ALPHA) * current_q + ALPHA * (reward + GAMMA * max_next_q)
-        q_table[state][action] = new_q
-    except Exception: pass
-
-# --- PROFIT & LOGGING LOGIC ---
-def log_trade_to_csv(symbol, action_name, result_type, net_profit):
-    """
-    Saves a permanent record of every trade outcome.
-    """
-    file_exists = os.path.isfile('trades.csv')
-    try:
-        with open('trades.csv', 'a', newline='') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(['Timestamp', 'Symbol', 'Action', 'Result', 'Net_Profit_Pct'])
-            
-            writer.writerow([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                symbol,
-                action_name,
-                result_type,
-                f"{net_profit*100:.4f}%"
-            ])
-    except Exception: pass
+        curr = get_q_values(state)[action]
+        max_next = np.max(get_q_values(next_state))
+        q_table[state][action] = (1 - ALPHA) * curr + ALPHA * (reward + GAMMA * max_next)
+    except: pass
 
 def calculate_reward(entry, current, pos_type, symbol):
-    raw_profit = 0
-    if pos_type == 'long': 
-        raw_profit = (current - entry) / entry
-    elif pos_type == 'short': 
-        raw_profit = (entry - current) / entry
+    raw = (current - entry) / entry if pos_type == 'long' else (entry - current) / entry
+    net = raw - ROUND_TRIP_COST
     
-    # Net Profit (Fee Aware)
-    net_reward = raw_profit - ROUND_TRIP_COST
+    res = "WIN" if net > 0 else "LOSS"
+    bot_memory['last_trade'] = f"{symbol} {pos_type.upper()} {res} ({net*100:.2f}%)"
     
-    # Log Result
-    action_name = "LONG" if pos_type == 'long' else "SHORT"
-    result_type = "WIN" if net_reward > 0 else "LOSS"
-    
-    # Only log if it was a real trade attempt (not just holding)
-    log_trade_to_csv(symbol, action_name, result_type, net_reward)
-    
-    return net_reward
-
-def save_bot_state(stats):
     try:
-        data = { "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "stats": stats, "q_table": q_table }
-        with open('bot_state.json', 'w') as f: json.dump(data, f, indent=4)
-    except Exception: pass
+        with open('trades.csv', 'a', newline='') as f:
+            csv.writer(f).writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, pos_type, res, f"{net*100:.4f}%"])
+    except: pass
+    
+    return net
 
-# --- EXECUTION ---
 def execute_trade(exchange, symbol, action, atr, close_price):
     if action == 0: return
-
-    mock_balance = 1000 
-    risk_amt = mock_balance * RISK_PER_TRADE
+    
+    balance = 1000 
+    risk = balance * bot_memory['risk_per_trade']
+    
     if pd.isna(atr) or atr == 0: atr = close_price * 0.01 
-    position_size = risk_amt / atr
-    position_size = min(position_size, mock_balance / close_price * MAX_LEVERAGE)
-
+    size = min(risk / atr, balance / close_price * MAX_LEVERAGE)
+    
     side = "BUY" if action == 1 else "SELL"
-    logger.info(f"Signal: {side} {symbol} | Size: {position_size:.4f}")
+    logger.info(f"Signal: {side} {symbol} | Size: {size:.4f} | Risk: {bot_memory['risk_per_trade']*100}%")
 
-# --- Main Loop ---
+def save_bot_state():
+    try:
+        data = { "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "stats": bot_memory, "q_table": q_table }
+        with open('bot_state.json', 'w') as f: json.dump(data, f, indent=4)
+    except: pass
+
+# --- MAIN LOOP ---
 def main():
+    t = threading.Thread(target=run_web_server)
+    t.daemon = True 
+    t.start()
+
     exchange = connect_exchange()
     if not exchange: return
 
-    # Stats now include Cumulative PnL
-    stats = {'wins': 0, 'losses': 0, 'total_actions': 0, 'cumulative_pnl_percent': 0.0}
-    
     prev_states = {s: 'unknown' for s in SYMBOLS}
     prev_prices = {s: 0.0 for s in SYMBOLS}
     last_actions = {s: 0 for s in SYMBOLS}
 
-    logger.info(f"Bot Active on {len(SYMBOLS)} Pairs. Black Box Recorder Enabled.")
+    logger.info("🚀 System Online. Access Dashboard to monitor.")
 
     while True:
         try:
+            if bot_memory['status'] == "PAUSED":
+                time.sleep(5) 
+                continue
+
             for symbol in SYMBOLS:
                 df = fetch_data(exchange, symbol)
                 if df.empty: continue
@@ -222,24 +291,19 @@ def main():
                 curr_price = df.iloc[-1]['close']
                 curr_atr = df.iloc[-1]['ATR'] if 'ATR' in df else 0
                 
-                # Reward & Update
                 p_state, p_action = prev_states[symbol], last_actions[symbol]
-                if p_state != 'unknown':
-                    reward = 0
-                    if p_action == 1: 
-                        reward = calculate_reward(prev_prices[symbol], curr_price, 'long', symbol)
-                    elif p_action == 2: 
-                        reward = calculate_reward(prev_prices[symbol], curr_price, 'short', symbol)
+                
+                if p_state != 'unknown' and p_action != 0:
+                    pos_type = 'long' if p_action == 1 else 'short'
+                    reward = calculate_reward(prev_prices[symbol], curr_price, pos_type, symbol)
                     
-                    if p_action != 0:
-                        stats['total_actions'] += 1
-                        stats['cumulative_pnl_percent'] += reward
-                        if reward > 0: stats['wins'] += 1
-                        elif reward < 0: stats['losses'] += 1
+                    bot_memory['total_actions'] += 1
+                    bot_memory['cumulative_pnl_percent'] += reward
+                    if reward > 0: bot_memory['wins'] += 1
+                    else: bot_memory['losses'] += 1
                     
                     update_q_table(p_state, p_action, reward, curr_state)
 
-                # Action & Execute
                 action = choose_action(curr_state)
                 execute_trade(exchange, symbol, action, curr_atr, curr_price)
                 
@@ -249,12 +313,12 @@ def main():
                 
                 time.sleep(0.2) 
             
-            save_bot_state(stats)
+            save_bot_state()
             time.sleep(50) 
 
         except KeyboardInterrupt: break
         except Exception as e:
-            logger.error(f"Loop Error: {e}")
+            logger.error(f"System Error: {e}")
             time.sleep(30)
 
 if __name__ == "__main__":
