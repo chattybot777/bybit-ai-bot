@@ -31,7 +31,8 @@ SYMBOLS = [
 # Q-Learning Constants
 ALPHA = 0.1  
 GAMMA = 0.9  
-EPSILON = 0.1 
+# --- CRITICAL CHANGE: Epsilon reduced from 0.1 to 0.05 ---
+EPSILON = 0.05 
 ROUND_TRIP_COST = 0.0015 
 MAX_LEVERAGE = 5
 
@@ -309,7 +310,7 @@ def main():
                 prev_prices[symbol] = curr_price
                 last_actions[symbol] = action
                 
-                time.sleep(0.5) # Increased sleep for safety with fewer coins
+                time.sleep(0.5) 
             
             if trades_made == 0:
                 logger.info(f"💤 Scan Complete. Market calm. {len(SYMBOLS)} pairs checked.")
