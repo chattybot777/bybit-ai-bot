@@ -31,10 +31,12 @@ SYMBOLS = [
 # Q-Learning Constants
 ALPHA = 0.1  
 GAMMA = 0.9  
-# --- CRITICAL CHANGE: Epsilon reduced from 0.1 to 0.05 ---
 EPSILON = 0.05 
 ROUND_TRIP_COST = 0.0015 
 MAX_LEVERAGE = 5
+
+# --- NEW: Maximum acceptable simulated loss per trade (2.5% safety net) ---
+MAX_SIMULATED_LOSS = -0.025 
 
 # --- Shared Memory ---
 bot_memory = {
@@ -230,9 +232,16 @@ def update_q_table(state, action, reward, next_state):
 
 def calculate_reward(entry, current, pos_type, symbol):
     raw = (current - entry) / entry if pos_type == 'long' else (entry - current) / entry
-    net = raw - ROUND_TRIP_COST
     
-    res = "WIN" if net > 0 else "LOSS"
+    # --- CRITICAL CHANGE: Enforce Max Simulated Loss ---
+    # This prevents a single volatile trade from corrupting the entire Q-Table.
+    if raw < MAX_SIMULATED_LOSS:
+        net = MAX_SIMULATED_LOSS # Cap the loss at -2.5%
+        res = "STOPPED_OUT"
+    else:
+        net = raw - ROUND_TRIP_COST
+        res = "WIN" if net > 0 else "LOSS"
+    
     bot_memory['last_trade'] = f"{symbol} {pos_type.upper()} {res} ({net*100:.2f}%)"
     
     try:
