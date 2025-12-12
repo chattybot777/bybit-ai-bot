@@ -35,15 +35,18 @@ EPSILON = 0.05
 ROUND_TRIP_COST = 0.0015 
 MAX_LEVERAGE = 5
 
-# --- NEW: Maximum acceptable simulated loss per trade (2.5% safety net) ---
-MAX_SIMULATED_LOSS = -0.025 
+# --- Risk Caps ---
+MAX_SIMULATED_LOSS = -0.025 # Enforce Max Simulated Loss of 2.5%
 
 # --- Shared Memory ---
+# UPDATED: Added new metrics for risk management
 bot_memory = {
     'wins': 0, 
     'losses': 0, 
     'total_actions': 0, 
     'cumulative_pnl_percent': 0.0,
+    'max_pnl_peak': 0.0, # New peak tracking for drawdown
+    'max_drawdown': 0.0, # New max drawdown metric
     'last_trade': "None yet",
     'status': "RUNNING", 
     'risk_per_trade': 0.02, 
@@ -71,26 +74,31 @@ def dashboard():
     state_color = "green" if bot_memory['status'] == "RUNNING" else "red"
     logs_html = "".join([f"<div style='border-bottom:1px solid #eee; padding:5px; font-family:monospace; font-size:12px;'>{log}</div>" for log in log_buffer])
     
+    # Calculate derived metrics for display
+    total_actions = bot_memory['total_actions']
+    win_rate = (bot_memory['wins'] / total_actions) * 100 if total_actions > 0 else 0.00
+    
     html = f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Gavin's AI Trader (Top 5)</title>
+        <title>Gavin's AI Trader (Full Control)</title>
         <meta http-equiv="refresh" content="10">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
             body {{ font-family: -apple-system, system-ui, sans-serif; background: #f0f2f5; padding: 20px; margin: 0; }}
             .container {{ max-width: 800px; margin: auto; }}
             .card {{ background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }}
-            .stat-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }}
+            .stat-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }}
             .stat-box {{ background: #f8f9fa; padding: 10px; border-radius: 8px; text-align: center; }}
             .value {{ font-size: 20px; font-weight: bold; color: #333; }}
             .label {{ color: #666; font-size: 12px; }}
             .log-box {{ height: 300px; overflow-y: auto; background: #fff; border: 1px solid #ddd; padding: 10px; border-radius: 8px; }}
-            button {{ padding: 10px 20px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; margin-right: 5px; }}
+            button {{ padding: 10px 20px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; margin-right: 5px; transition: background-color 0.2s; }}
             .btn-stop {{ background: #ff4757; color: white; }}
             .btn-start {{ background: #2ed573; color: white; }}
             .btn-update {{ background: #3742fa; color: white; }}
+            .btn-reset {{ background: #ff7f50; color: white; }}
             input {{ padding: 8px; border-radius: 4px; border: 1px solid #ccc; width: 80px; }}
         </style>
     </head>
@@ -98,26 +106,34 @@ def dashboard():
         <div class="container">
             <div class="card">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
-                    <h2>🤖 Top 5 Sniper</h2>
+                    <h2>🤖 Full Mission Control</h2>
                     <span style="background:{state_color}; color:white; padding:5px 15px; border-radius:20px; font-weight:bold; font-size:12px;">
                         {bot_memory['status']}
                     </span>
                 </div>
+                <p style="font-size:12px; color:#666; text-align:center;">Uptime: {bot_memory['uptime']}</p>
                 
                 <div class="stat-grid">
-                    <div class="stat-box"><div class="value" style="color:green">{bot_memory['wins']}</div><div class="label">Wins</div></div>
-                    <div class="stat-box"><div class="value" style="color:red">{bot_memory['losses']}</div><div class="label">Losses</div></div>
-                    <div class="stat-box"><div class="value">{bot_memory['total_actions']}</div><div class="label">Total Trades</div></div>
-                    <div class="stat-box"><div class="value">{bot_memory['cumulative_pnl_percent']*100:.2f}%</div><div class="label">Net PnL</div></div>
+                    <div class="stat-box"><div class="value" style="color:green">{bot_memory['wins']}</div><div class="label">Total Wins</div></div>
+                    <div class="stat-box"><div class="value">{total_actions}</div><div class="label">Total Trades</div></div>
+                    <div class="stat-box"><div class="value" style="color:red">{bot_memory['losses']}</div><div class="label">Total Losses</div></div>
                 </div>
-                <p style="font-size:14px;"><strong>Last Action:</strong> {bot_memory['last_trade']}</p>
+
+                <div class="stat-grid" style="margin-top: 15px;">
+                    <div class="stat-box"><div class="value">{bot_memory['cumulative_pnl_percent']*100:.2f}%</div><div class="label">Net PnL</div></div>
+                    <div class="stat-box"><div class="value">{win_rate:.2f}%</div><div class="label">Win Rate</div></div>
+                    <div class="stat-box"><div class="value" style="color:red">{bot_memory['max_drawdown']*100:.2f}%</div><div class="label">Max Drawdown</div></div>
+                </div>
+
+                <p style="font-size:14px; margin-top: 15px;"><strong>Last Action:</strong> {bot_memory['last_trade']}</p>
             </div>
 
             <div class="card">
                 <h3>⚙️ Controls</h3>
-                <form action="/control" method="post" style="margin-bottom:15px;">
+                <form action="/control" method="post" style="margin-bottom:15px; display:flex; align-items:center;">
                     <button name="action" value="start" class="btn-start">▶ Resume</button>
                     <button name="action" value="stop" class="btn-stop">⏸ Pause</button>
+                    <button name="action" value="reset" class="btn-reset" onclick="return confirm('Are you SURE you want to reset the Q-Table? This will restart the bot\'s learning from scratch!')">🧠 Reset Brain</button>
                 </form>
                 
                 <form action="/settings" method="post">
@@ -134,6 +150,12 @@ def dashboard():
                 </div>
             </div>
         </div>
+        <script>
+            // Simple function to confirm reset
+            function confirm(message) {{
+                return window.confirm(message); // Using window.confirm as a temporary UI substitute
+            }}
+        </script>
     </body>
     </html>
     """
@@ -148,6 +170,23 @@ def control():
     elif action == 'start':
         bot_memory['status'] = "RUNNING"
         logger.info("▶ BOT RESUMED")
+    elif action == 'reset':
+        # Reset core learning metrics and Q-table
+        bot_memory.update({
+            'wins': 0, 
+            'losses': 0, 
+            'total_actions': 0, 
+            'cumulative_pnl_percent': 0.0,
+            'max_pnl_peak': 0.0,
+            'max_drawdown': 0.0,
+            'last_trade': "BRAIN RESET",
+            'uptime': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+        global q_table
+        q_table = {} # Clear the Q-Table
+        save_bot_state() # Immediately save the empty state
+        logger.critical("🧠 Q-TABLE WIPED. LEARNING RESTARTED.")
+    
     return redirect(url_for('dashboard'))
 
 @app.route('/settings', methods=['POST'])
@@ -234,13 +273,24 @@ def calculate_reward(entry, current, pos_type, symbol):
     raw = (current - entry) / entry if pos_type == 'long' else (entry - current) / entry
     
     # --- CRITICAL CHANGE: Enforce Max Simulated Loss ---
-    # This prevents a single volatile trade from corrupting the entire Q-Table.
     if raw < MAX_SIMULATED_LOSS:
         net = MAX_SIMULATED_LOSS # Cap the loss at -2.5%
         res = "STOPPED_OUT"
     else:
         net = raw - ROUND_TRIP_COST
         res = "WIN" if net > 0 else "LOSS"
+    
+    # Update Drawdown Metrics
+    bot_memory['cumulative_pnl_percent'] += net
+    
+    # Update PNL Peak
+    if bot_memory['cumulative_pnl_percent'] > bot_memory['max_pnl_peak']:
+        bot_memory['max_pnl_peak'] = bot_memory['cumulative_pnl_percent']
+    
+    # Update Max Drawdown
+    drawdown = bot_memory['max_pnl_peak'] - bot_memory['cumulative_pnl_percent']
+    if drawdown > bot_memory['max_drawdown']:
+        bot_memory['max_drawdown'] = drawdown
     
     bot_memory['last_trade'] = f"{symbol} {pos_type.upper()} {res} ({net*100:.2f}%)"
     
@@ -280,8 +330,22 @@ def main():
     prev_states = {s: 'unknown' for s in SYMBOLS}
     prev_prices = {s: 0.0 for s in SYMBOLS}
     last_actions = {s: 0 for s in SYMBOLS}
+    
+    # Load Q-Table and stats if they exist
+    try:
+        with open('bot_state.json', 'r') as f:
+            loaded_data = json.load(f)
+            bot_memory.update(loaded_data['stats'])
+            global q_table
+            q_table = loaded_data['q_table']
+            logger.info(f"🧠 Bot state loaded. Uptime: {bot_memory['uptime']}")
+    except FileNotFoundError:
+        logger.info("🧠 Starting new Q-Learning session.")
+    except Exception as e:
+        logger.warning(f"Error loading state: {e}. Starting fresh.")
 
-    logger.info(f"🚀 Top 5 Sniper Mode Active. Monitoring: {SYMBOLS}")
+
+    logger.info(f"🚀 Full Control Mode Active. Monitoring: {SYMBOLS}")
 
     while True:
         try:
@@ -305,7 +369,7 @@ def main():
                     reward = calculate_reward(prev_prices[symbol], curr_price, pos_type, symbol)
                     
                     bot_memory['total_actions'] += 1
-                    bot_memory['cumulative_pnl_percent'] += reward
+                    
                     if reward > 0: bot_memory['wins'] += 1
                     else: bot_memory['losses'] += 1
                     
