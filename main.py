@@ -39,14 +39,13 @@ MAX_LEVERAGE = 5
 MAX_SIMULATED_LOSS = -0.025 # Enforce Max Simulated Loss of 2.5%
 
 # --- Shared Memory ---
-# UPDATED: Added new metrics for risk management
 bot_memory = {
     'wins': 0, 
     'losses': 0, 
     'total_actions': 0, 
     'cumulative_pnl_percent': 0.0,
-    'max_pnl_peak': 0.0, # New peak tracking for drawdown
-    'max_drawdown': 0.0, # New max drawdown metric
+    'max_pnl_peak': 0.0, 
+    'max_drawdown': 0.0, 
     'last_trade': "None yet",
     'status': "RUNNING", 
     'risk_per_trade': 0.02, 
@@ -82,7 +81,7 @@ def dashboard():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Gavin's AI Trader (Full Control)</title>
+        <title>Gavin's AI Trader (Stable Logic V2)</title>
         <meta http-equiv="refresh" content="10">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
@@ -272,7 +271,7 @@ def update_q_table(state, action, reward, next_state):
 def calculate_reward(entry, current, pos_type, symbol):
     raw = (current - entry) / entry if pos_type == 'long' else (entry - current) / entry
     
-    # --- CRITICAL CHANGE: Enforce Max Simulated Loss ---
+    # --- ENFORCE MAX SIMULATED LOSS ---
     if raw < MAX_SIMULATED_LOSS:
         net = MAX_SIMULATED_LOSS # Cap the loss at -2.5%
         res = "STOPPED_OUT"
@@ -280,14 +279,12 @@ def calculate_reward(entry, current, pos_type, symbol):
         net = raw - ROUND_TRIP_COST
         res = "WIN" if net > 0 else "LOSS"
     
-    # Update Drawdown Metrics
+    # Update PNL and Drawdown Metrics
     bot_memory['cumulative_pnl_percent'] += net
     
-    # Update PNL Peak
     if bot_memory['cumulative_pnl_percent'] > bot_memory['max_pnl_peak']:
         bot_memory['max_pnl_peak'] = bot_memory['cumulative_pnl_percent']
     
-    # Update Max Drawdown
     drawdown = bot_memory['max_pnl_peak'] - bot_memory['cumulative_pnl_percent']
     if drawdown > bot_memory['max_drawdown']:
         bot_memory['max_drawdown'] = drawdown
@@ -302,6 +299,7 @@ def calculate_reward(entry, current, pos_type, symbol):
     return net
 
 def execute_trade(exchange, symbol, action, atr, close_price, state):
+    # This function only logs the ENTRY, it doesn't calculate the reward here.
     if action == 0: return
     
     balance = 1000 
@@ -310,7 +308,7 @@ def execute_trade(exchange, symbol, action, atr, close_price, state):
     size = min(risk / atr, balance / close_price * MAX_LEVERAGE)
     
     side = "BUY" if action == 1 else "SELL"
-    logger.info(f"⚡ {side} {symbol} | State: {state} | Size: {size:.4f}")
+    logger.info(f"⚡ ENTRY {side} {symbol} | State: {state} | Size: {size:.4f}")
 
 def save_bot_state():
     try:
@@ -327,9 +325,11 @@ def main():
     exchange = connect_exchange()
     if not exchange: return
 
+    # prev_states tracks the market state AT the time of the entry
     prev_states = {s: 'unknown' for s in SYMBOLS}
     prev_prices = {s: 0.0 for s in SYMBOLS}
-    last_actions = {s: 0 for s in SYMBOLS}
+    # last_actions tracks the action taken: 0=No position, 1=Long, 2=Short
+    last_actions = {s: 0 for s in SYMBOLS} 
     
     # Load Q-Table and stats if they exist
     try:
@@ -345,7 +345,7 @@ def main():
         logger.warning(f"Error loading state: {e}. Starting fresh.")
 
 
-    logger.info(f"🚀 Full Control Mode Active. Monitoring: {SYMBOLS}")
+    logger.info(f"🚀 Stable Logic V2 Active. Monitoring: {SYMBOLS}")
 
     while True:
         try:
@@ -360,11 +360,13 @@ def main():
                 
                 curr_state = get_state(df)
                 curr_price = df.iloc[-1]['close']
-                curr_atr = df.iloc[-1]['ATR'] if 'ATR' in df else 0
                 
                 p_state, p_action = prev_states[symbol], last_actions[symbol]
                 
-                if p_state != 'unknown' and p_action != 0:
+                # --- NEW, CRITICAL LOGIC: Enforce Round-Trip ---
+                if p_action != 0:
+                    # POSITION OPEN: Force Exit/Reward Calculation
+                    
                     pos_type = 'long' if p_action == 1 else 'short'
                     reward = calculate_reward(prev_prices[symbol], curr_price, pos_type, symbol)
                     
@@ -374,14 +376,24 @@ def main():
                     else: bot_memory['losses'] += 1
                     
                     update_q_table(p_state, p_action, reward, curr_state)
-
-                action = choose_action(curr_state)
-                execute_trade(exchange, symbol, action, curr_atr, curr_price, curr_state)
-                if action != 0: trades_made += 1
-                
-                prev_states[symbol] = curr_state
-                prev_prices[symbol] = curr_price
-                last_actions[symbol] = action
+                    
+                    # Position is now closed. Clear entry records.
+                    last_actions[symbol] = 0
+                    
+                else:
+                    # NO POSITION OPEN: Choose a new action (Entry)
+                    action = choose_action(curr_state)
+                    
+                    if action != 0:
+                        # Entry Execution
+                        curr_atr = df.iloc[-1]['ATR'] if 'ATR' in df else 0
+                        execute_trade(exchange, symbol, action, curr_atr, curr_price, curr_state)
+                        
+                        # Record the entry for the next loop's reward calculation
+                        prev_states[symbol] = curr_state
+                        prev_prices[symbol] = curr_price
+                        last_actions[symbol] = action
+                        trades_made += 1
                 
                 time.sleep(0.5) 
             
