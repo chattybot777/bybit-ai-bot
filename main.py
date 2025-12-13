@@ -81,7 +81,7 @@ def dashboard():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Gavin's AI Trader (Stable Logic V2)</title>
+        <title>Gavin's AI Trader (Stable Logic V3)</title>
         <meta http-equiv="refresh" content="10">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
@@ -279,7 +279,7 @@ def calculate_reward(entry, current, pos_type, symbol):
         net = raw - ROUND_TRIP_COST
         res = "WIN" if net > 0 else "LOSS"
     
-    # Update PNL and Drawdown Metrics
+    # Update PNL and Drawdown Metrics (Accumulation is handled here, only once per trade)
     bot_memory['cumulative_pnl_percent'] += net
     
     if bot_memory['cumulative_pnl_percent'] > bot_memory['max_pnl_peak']:
@@ -299,7 +299,7 @@ def calculate_reward(entry, current, pos_type, symbol):
     return net
 
 def execute_trade(exchange, symbol, action, atr, close_price, state):
-    # This function only logs the ENTRY, it doesn't calculate the reward here.
+    # This function only logs the ENTRY, setting up the necessary state for the EXIT
     if action == 0: return
     
     balance = 1000 
@@ -345,7 +345,7 @@ def main():
         logger.warning(f"Error loading state: {e}. Starting fresh.")
 
 
-    logger.info(f"🚀 Stable Logic V2 Active. Monitoring: {SYMBOLS}")
+    logger.info(f"🚀 Stable Logic V3 Active. Monitoring: {SYMBOLS}")
 
     while True:
         try:
@@ -363,7 +363,7 @@ def main():
                 
                 p_state, p_action = prev_states[symbol], last_actions[symbol]
                 
-                # --- NEW, CRITICAL LOGIC: Enforce Round-Trip ---
+                # --- CRITICAL LOGIC: EXIT PHASE (P_ACTION != 0 means a trade is open) ---
                 if p_action != 0:
                     # POSITION OPEN: Force Exit/Reward Calculation
                     
@@ -380,6 +380,7 @@ def main():
                     # Position is now closed. Clear entry records.
                     last_actions[symbol] = 0
                     
+                # --- CRITICAL LOGIC: ENTRY PHASE (P_ACTION == 0 means no trade is open) ---
                 else:
                     # NO POSITION OPEN: Choose a new action (Entry)
                     action = choose_action(curr_state)
